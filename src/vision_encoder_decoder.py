@@ -23,7 +23,7 @@ from torch.nn import CrossEntropyLoss
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 from transformers.modeling_utils import PreTrainedModel
-#from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
+# from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from transformers.utils import logging
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.auto.modeling_auto import AutoModel, AutoModelForCausalLM
@@ -36,6 +36,8 @@ from .xglm import ThisXGLMForCausalLM
 from .xglm import ThisXGLMConfig
 from .opt import ThisOPTForCausalLM
 from .opt import ThisOPTConfig
+from .modules.CBSA import CBSA
+
 
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
@@ -150,15 +152,16 @@ VISION_ENCODER_DECODER_INPUTS_DOCSTRING = r"""
             - With a *decoder_* prefix which will be input as `**decoder_kwargs` for the decoder forward function.
 """
 
+
 class SmallCapConfig(VisionEncoderDecoderConfig):
     model_type = "smallcap"
 
     def __init__(
-        self,
-        **kwargs,
+            self,
+            **kwargs,
     ):
         super().__init__(**kwargs)
-        
+
 
 class SmallCap(PreTrainedModel):
     r"""
@@ -172,10 +175,10 @@ class SmallCap(PreTrainedModel):
     main_input_name = "pixel_values"
 
     def __init__(
-        self,
-        config: Optional[PretrainedConfig] = None,
-        encoder: Optional[PreTrainedModel] = None,
-        decoder: Optional[PreTrainedModel] = None,
+            self,
+            config: Optional[PretrainedConfig] = None,
+            encoder: Optional[PreTrainedModel] = None,
+            decoder: Optional[PreTrainedModel] = None,
     ):
         if config is None and (encoder is None or decoder is None):
             raise ValueError("Either a configuration or an encoder and a decoder has to be provided.")
@@ -208,7 +211,24 @@ class SmallCap(PreTrainedModel):
         self.encoder = encoder.vision_model
         self.encoder.main_input_name = 'pixel_values'
         self.decoder = decoder
-        # make sure that the individual model's config refers to the shared config
+        # ===> BEGIN: add CBSA bridge (between encoder and decoder cross-attn)  <===
+        self.use_cbsa = getattr(self.config, "use_cbsa", False)
+        if self.use_cbsa:
+            enc_hidden = (
+                self.encoder.config.hidden_size
+                if hasattr(self.encoder.config, "hidden_size")
+                else self.encoder.config.vision_config.hidden_size
+            )
+            self.cbsa = CBSA(
+                dim=enc_hidden,
+                heads=int(getattr(self.config, "cbsa_num_heads", 8)),
+                dim_head=None,  # 默认自动dim//heads
+                rep_h=int(getattr(self.config, "cbsa_rep_h", 8)),
+                rep_w=int(getattr(self.config, "cbsa_rep_w", 8)),
+                cls_pos=str(getattr(self.config, "cbsa_cls_pos", "first")),  # CLIP：“first”
+                dropout=float(getattr(self.config, "cbsa_dropout", 0.0)),
+            )
+            # make sure that the individual model's config refers to the shared config
         # so that the updates to the config will be synced
         self.encoder.config = self.config.encoder
         self.decoder.config = self.config.decoder
@@ -238,12 +258,12 @@ class SmallCap(PreTrainedModel):
 
     @classmethod
     def from_encoder_decoder_pretrained(
-        cls,
-        encoder_pretrained_model_name_or_path: str = None,
-        decoder_pretrained_model_name_or_path: str = None,
-        cross_attention_reduce_factor: int = None,
-        *model_args,
-        **kwargs
+            cls,
+            encoder_pretrained_model_name_or_path: str = None,
+            decoder_pretrained_model_name_or_path: str = None,
+            cross_attention_reduce_factor: int = None,
+            *model_args,
+            **kwargs
     ) -> PreTrainedModel:
         r"""
         Instantiate an encoder and a decoder from one or two base classes of the library from pretrained model
@@ -308,11 +328,11 @@ class SmallCap(PreTrainedModel):
         ```"""
 
         kwargs_encoder = {
-            argument[len("encoder_") :]: value for argument, value in kwargs.items() if argument.startswith("encoder_")
+            argument[len("encoder_"):]: value for argument, value in kwargs.items() if argument.startswith("encoder_")
         }
 
         kwargs_decoder = {
-            argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
+            argument[len("decoder_"):]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
 
         # remove encoder, decoder kwargs from kwargs
@@ -384,7 +404,7 @@ class SmallCap(PreTrainedModel):
                 decoder_config.encoder_hidden_size = encoder.config.vision_config.hidden_size
                 decoder_config.cross_attention_reduce_factor = cross_attention_reduce_factor
                 kwargs_decoder["config"] = decoder_config
-            
+
             if kwargs_decoder["config"].is_decoder is False or kwargs_decoder["config"].add_cross_attention is False:
                 logger.warning(
                     f"Decoder model {decoder_pretrained_model_name_or_path} is not initialized as a decoder. "
@@ -393,8 +413,8 @@ class SmallCap(PreTrainedModel):
                     "passed to `.from_encoder_decoder_pretrained(...)` are set to `True` or do not pass a "
                     "`decoder_config` to `.from_encoder_decoder_pretrained(...)`"
                 )
-            
-            #decoder = AutoModelForCausalLM.from_pretrained(decoder_pretrained_model_name_or_path, **kwargs_decoder)
+
+            # decoder = AutoModelForCausalLM.from_pretrained(decoder_pretrained_model_name_or_path, **kwargs_decoder)
             if "xglm" in decoder_pretrained_model_name_or_path:
                 decoder = ThisXGLMForCausalLM.from_pretrained(decoder_pretrained_model_name_or_path, **kwargs_decoder)
 
@@ -411,19 +431,19 @@ class SmallCap(PreTrainedModel):
         return cls(encoder=encoder, decoder=decoder, config=config)
 
     def forward(
-        self,
-        pixel_values=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        encoder_outputs=None,
-        past_key_values=None,
-        decoder_inputs_embeds=None,
-        labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        **kwargs,
+            self,
+            pixel_values=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            encoder_outputs=None,
+            past_key_values=None,
+            decoder_inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            **kwargs,
     ):
         r"""
         Returns:
@@ -458,18 +478,18 @@ class SmallCap(PreTrainedModel):
         >>> generated_ids = model.generate(pixel_values)
         >>> generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         ```"""
- 
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
 
         kwargs_decoder = {
-            argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
+            argument[len("decoder_"):]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
         if encoder_outputs is None:
             if pixel_values is None:
                 raise ValueError("You have to specify pixel_values")
-            
+
             encoder_outputs = self.encoder(
                 pixel_values=pixel_values,
                 output_attentions=output_attentions,
@@ -484,13 +504,17 @@ class SmallCap(PreTrainedModel):
 
         encoder_hidden_states = encoder_outputs[0]
 
+        # >>> 插入CBSA预处理
+        if getattr(self, "use_cbsa", False):
+            encoder_hidden_states = self.cbsa(encoder_hidden_states)
+
         # else:
         encoder_attention_mask = None
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
             decoder_input_ids = shift_tokens_right(
                 labels, self.config.pad_token_id, self.config.decoder_start_token_id
             )
-        
+
         # Decode
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -512,7 +536,7 @@ class SmallCap(PreTrainedModel):
             logits = decoder_outputs.logits if return_dict else decoder_outputs[0]
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), labels.view(-1))
-        
+
         if not return_dict:
             if loss is not None:
                 return (loss,) + decoder_outputs + encoder_outputs
@@ -535,7 +559,7 @@ class SmallCap(PreTrainedModel):
         return shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
 
     def prepare_inputs_for_generation(
-        self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
+            self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
     ):
         decoder_inputs = self.decoder.prepare_inputs_for_generation(input_ids, past=past)
         decoder_attention_mask = decoder_inputs["attention_mask"] if "attention_mask" in decoder_inputs else None

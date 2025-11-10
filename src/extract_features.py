@@ -12,8 +12,8 @@ from transformers import CLIPFeatureExtractor, CLIPVisionModel
 
 logging.set_verbosity_error()
 
-data_dir = 'C:\\Develop\\CV\\smallcap-main\\data\\images\\train\\'
-features_dir = 'C:\\Develop\\CV\\smallcap-main\\features\\'
+data_dir = './data/images/train/'
+features_dir = './features/'
 
 # 打印当前工作目录
 print(f"当前工作目录: {os.getcwd()}")
@@ -21,11 +21,11 @@ print(f"当前工作目录: {os.getcwd()}")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 encoder_name = 'openai/clip-vit-base-patch32'
-local_model_path = 'C:\\Develop\\CV\\smallcap-main\\clip-vit-base-patch32'
+local_model_path = './clip-vit-base-patch32'
 feature_extractor = CLIPFeatureExtractor.from_pretrained(local_model_path)
 clip_encoder = CLIPVisionModel.from_pretrained(local_model_path).to(device)
 
-annotations = json.load(open('C:\\Develop\\CV\\smallcap-main\\data\\dataset_coco.json'))['images']
+annotations = json.load(open('./data/dataset_coco.json'))['images']
 
 
 def load_data():

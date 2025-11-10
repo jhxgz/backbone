@@ -173,7 +173,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Model Training')
-    parser.add_argument("--images_dir", type=str, default="data/images/", help="Directory where input image features are stored")
+    parser.add_argument("--images_dir", type=str, default="data/images/train/", help="Directory where input image features are stored")
     parser.add_argument("--features_path", type=str, default='features/val.hdf5', help="H5 file with cached input image features")
     parser.add_argument("--annotations_path", type=str, default="data/dataset_coco.json", help="JSON file with annotations in Karpathy splits")
         
