@@ -10,6 +10,8 @@ import torch
 from transformers import AutoTokenizer, CLIPFeatureExtractor, AutoModel
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
+from transformers import CLIPTextModel, CLIPTokenizer
+
 
 from src.utils import load_data_for_inference, prep_strings, postprocess_preds
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -46,7 +48,7 @@ def evaluate_norag_model(args, feature_extractor, tokenizer, model, eval_df):
 
 def evaluate_rag_model(args, feature_extractor, tokenizer, model, eval_df):
     """RAG models can only be evaluated with a batch of length 1."""
-    
+
     template = open(args.template_path).read().strip() + ' '
 
     if args.features_path is not None:
@@ -56,38 +58,146 @@ def evaluate_rag_model(args, feature_extractor, tokenizer, model, eval_df):
     for idx in tqdm(range(len(eval_df))):
         file_name = eval_df['file_name'][idx]
         image_id = eval_df['image_id'][idx]
-        caps = eval_df['caps'][idx]
+        caps = eval_df['caps'][idx]  # list[str]
+
+        # --- 1) encode retrieved captions into CLIP text pooled embeddings ---
+        # if no caps available, use None
+        if caps is None or len(caps) == 0:
+            retrieved_tensor = None
+            retrieved_mask = None
+        else:
+            # use model.text_tokenizer and model.text_encoder if attached (load_model already attaches them)
+            toks = model.text_tokenizer(caps, padding=True, truncation=True, return_tensors="pt")
+            toks = {k: v.to(args.device) for k, v in toks.items()}
+            with torch.no_grad():
+                out_enc = model.text_encoder(**toks)
+                pooled = out_enc.last_hidden_state[:, 0, :].detach()  # [k, D_text]
+            # reshape to [1, k, D] (batch size 1)
+            retrieved_tensor = pooled.unsqueeze(0)
+            retrieved_mask = torch.ones(1, pooled.size(0), dtype=torch.long, device=args.device)
+
+        # build decoder_input ids as before
         decoder_input_ids = prep_strings('', tokenizer, template=template, retrieved_caps=caps,
-                                                 k=int(args.k), is_test=True)
-        # load image
+                                         k=int(args.k), is_test=True)
+
+        # now pass retrieved_tensor (not raw strings) into generate
         if args.features_path is not None:
             encoder_last_hidden_state = torch.FloatTensor([features[image_id][()]])
             encoder_outputs = BaseModelOutput(last_hidden_state=encoder_last_hidden_state.to(args.device))
             with torch.no_grad():
                 pred = model.generate(encoder_outputs=encoder_outputs,
-                               decoder_input_ids=torch.tensor([decoder_input_ids]).to(args.device),
-                               **args.generation_kwargs)
+                                      decoder_input_ids=torch.tensor([decoder_input_ids]).to(args.device),
+                                      retrieved_captions=retrieved_tensor,
+                                      retrieved_captions_mask=retrieved_mask,
+                                      **args.generation_kwargs)
+
         else:
             image = Image.open(args.images_dir + file_name).convert("RGB")
             pixel_values = feature_extractor(image, return_tensors="pt").pixel_values
             with torch.no_grad():
                 pred = model.generate(pixel_values.to(args.device),
-                               decoder_input_ids=torch.tensor([decoder_input_ids]).to(args.device),
-                               **args.generation_kwargs)
+                                      decoder_input_ids=torch.tensor([decoder_input_ids]).to(args.device),
+                                      retrieved_captions=retrieved_tensor,
+                                      retrieved_captions_mask=retrieved_mask,
+                                      **args.generation_kwargs)
+        # decode as before
         pred = tokenizer.decode(pred[0])
-
         pred = postprocess_preds(pred, tokenizer)
         out.append({"image_id": int(image_id), "caption": pred})
 
     return out
 
 def load_model(args, checkpoint_path):
+    import torch
+    import os
+    
     config = AutoConfig.from_pretrained(checkpoint_path + '/config.json')
-    model = AutoModel.from_pretrained(checkpoint_path)
+    
+    # 从检查点的state_dict中推断fusion_dim和text_hidden
+    state_dict_path = None
+    for filename in ['pytorch_model.bin', 'model.safetensors']:
+        if os.path.exists(checkpoint_path + '/' + filename):
+            state_dict_path = checkpoint_path + '/' + filename
+            break
+    
+    fusion_dim = None
+    text_hidden = None
+    
+    if state_dict_path:
+        if state_dict_path.endswith('.safetensors'):
+            try:
+                from safetensors.torch import load_file
+                state_dict = load_file(state_dict_path)
+            except:
+                state_dict = None
+        else:
+            state_dict = torch.load(state_dict_path, map_location='cpu')
+        
+        if state_dict:
+            # 从prompt_proj的权重形状推断
+            # nn.Linear(in_dim, out_dim) 权重形状是 [out_dim, in_dim]
+            # prompt_proj 是 PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
+            if 'prompt_proj.proj.weight' in state_dict:
+                weight_shape = state_dict['prompt_proj.proj.weight'].shape
+                fusion_dim = weight_shape[0]  # out_dim = fusion_dim
+                text_hidden = weight_shape[1]  # in_dim = text_hidden
+                print(f"从检查点推断: fusion_dim={fusion_dim}, text_hidden={text_hidden} (prompt_proj.proj.weight 形状: {weight_shape})")
+            elif 'visual_proj.proj.weight' in state_dict:
+                weight_shape = state_dict['visual_proj.proj.weight'].shape
+                fusion_dim = weight_shape[0]  # out_dim = fusion_dim
+                print(f"从检查点推断: fusion_dim={fusion_dim} (visual_proj.proj.weight 形状: {weight_shape})")
+    
+    # 设置config中的fusion_dim
+    if fusion_dim is not None:
+        config.fusion_dim = fusion_dim
+    
+    # 先加载CLIP text encoder（用于获取正确的text_hidden）
+    clip_text_tokenizer = CLIPTokenizer.from_pretrained(args.encoder_name)
+    clip_text_encoder = CLIPTextModel.from_pretrained(args.encoder_name)
+    for p in clip_text_encoder.parameters():
+        p.requires_grad = False
+    
+    # 如果从检查点推断的text_hidden与CLIP text encoder的hidden_size不同，需要特殊处理
+    actual_text_hidden = clip_text_encoder.config.hidden_size
+    if text_hidden is not None and text_hidden != actual_text_hidden:
+        print(f"警告: 检查点中的text_hidden={text_hidden}，但CLIP text encoder的hidden_size={actual_text_hidden}")
+        print("将在加载后手动修复prompt_proj...")
+    
+    # 加载模型（允许形状不匹配，稍后手动修复）
+    model = AutoModel.from_pretrained(
+        checkpoint_path,
+        config=config,
+        ignore_mismatched_sizes=True  # 允许形状不匹配
+    )
     model.config = config
-    model.eval()
+
+    # attach text encoder
+    model.text_tokenizer = clip_text_tokenizer
+    model.text_encoder = clip_text_encoder
+    
+    # 如果text_hidden不匹配，需要重新创建prompt_proj并加载权重
+    if text_hidden is not None and text_hidden != actual_text_hidden and state_dict:
+        print("重新创建prompt_proj以匹配检查点...")
+        from src.modules.multimodal_projection import PromptProjector
+        # 重新创建prompt_proj
+        model.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
+        # 从state_dict加载权重
+        if 'prompt_proj.proj.weight' in state_dict:
+            model.prompt_proj.proj.weight.data = state_dict['prompt_proj.proj.weight'].clone()
+            if 'prompt_proj.proj.bias' in state_dict:
+                model.prompt_proj.proj.bias.data = state_dict['prompt_proj.proj.bias'].clone()
+            if 'prompt_proj.ln.weight' in state_dict:
+                model.prompt_proj.ln.weight.data = state_dict['prompt_proj.ln.weight'].clone()
+            if 'prompt_proj.ln.bias' in state_dict:
+                model.prompt_proj.ln.bias.data = state_dict['prompt_proj.ln.bias'].clone()
+            print("prompt_proj权重已从检查点加载")
+    
+    # move both model and text encoder to device
+    clip_text_encoder.to(args.device)
     model.to(args.device)
+    model.eval()
     return model
+
 
 def infer_one_checkpoint(args, feature_extractor, tokenizer, checkpoint_path, eval_df, infer_fn):
     model = load_model(args, checkpoint_path)
@@ -182,7 +292,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--infer_test", action="store_true", default=False, help="Use test data instead of val data")
 
-    parser.add_argument("--encoder_name", type=str, default="openai/clip-vit-base-patch32", help="Encoder name as found of HuggingFace or stored locally")
+    parser.add_argument("--encoder_name", type=str, default="clip-vit-base-patch32", help="Encoder name as found of HuggingFace or stored locally")
     parser.add_argument("--decoder_name", type=str, default="gpt2", help="Decoder name as found of HuggingFace or stored locally")
 
     parser.add_argument("--disable_rag", action="store_true", default=False, help="Disable retrieval augmentation or not")

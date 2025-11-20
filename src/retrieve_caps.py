@@ -105,6 +105,62 @@ def filter_nns(nns, xb_image_ids, captions, xq_image_ids):
         assert len(good_nns) == 7
         retrieved_captions[image_id] = good_nns
     return retrieved_captions
+
+def load_datastore(datastore_dir):
+    """
+    Expect files in datastore_dir:
+      - index (faiss) e.g. 'coco_index' (binary)
+      - captions json e.g. 'coco_index_captions.json' (list of captions in same order as embeddings)
+      - optionally text pooled embeddings npy e.g. 'clip_text_pooled.npy' (N, D)
+    Returns: index, captions_list, caption_embs (numpy array or None)
+    """
+    idx_path = os.path.join(datastore_dir, "coco_index")
+    caps_json = os.path.join(datastore_dir, "coco_index_captions.json")
+    emb_path = os.path.join(datastore_dir, "clip_text_pooled.npy")
+
+    if not os.path.exists(idx_path):
+        raise FileNotFoundError(f"faiss index not found at {idx_path}")
+    index = faiss.read_index(idx_path)
+    captions = json.load(open(caps_json, 'r'))
+    caption_embs = None
+    if os.path.exists(emb_path):
+        caption_embs = np.load(emb_path).astype('float32')
+    return index, captions, caption_embs
+
+def retrieve_by_image_embs(image_embs_np, index, caption_embs=None, captions=None, topk=5, normalize=True, device="cuda"):
+    """
+    image_embs_np: np.array [B, D]  (CLIP vision pooled vectors)
+    index: faiss index built over caption_embs
+    caption_embs: np.array [N, D]  (if None, only returns indices)
+    captions: list[str] (optional)
+    Returns:
+      - retrieved_embs_t: torch.Tensor [B, topk, D] (or None if caption_embs None)
+      - retrieved_texts: list[list[str]] per image (or None)
+      - mask: torch.LongTensor [B, topk] with 1 valid, 0 pad
+    """
+    xq = image_embs_np.astype(np.float32)
+    if normalize:
+        faiss.normalize_L2(xq)
+    D, I = index.search(xq, topk)  # D distances, I indices shape [B, topk]
+    B = I.shape[0]
+
+    retrieved_texts = None
+    retrieved_embs = None
+    if caption_embs is not None:
+        # gather embeddings
+        emb = caption_embs[I]  # [B, topk, D]
+        # ensure float32
+        emb = emb.astype('float32')
+        # convert to torch tensor
+        retrieved_embs = torch.from_numpy(emb).to(device)
+
+    if captions is not None:
+        retrieved_texts = []
+        for irow in I:
+            retrieved_texts.append([captions[i] for i in irow.tolist()])
+
+    mask = torch.ones(B, topk, dtype=torch.long, device=device)
+    return retrieved_embs, retrieved_texts, mask
  
 def main(): 
 

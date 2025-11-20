@@ -9,6 +9,7 @@ os.environ["WANDB_DISABLED"] = "true"
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers import AutoTokenizer, CLIPFeatureExtractor, AutoModel, AutoModelForCausalLM
 from transformers import Seq2SeqTrainer, default_data_collator, Seq2SeqTrainingArguments
+from transformers import CLIPTextModel, CLIPTokenizer
 
 from transformers import VisionEncoderDecoderModel, CLIPModel, CLIPVisionModel, EncoderDecoderModel
 from src.vision_encoder_decoder import SmallCap, SmallCapConfig
@@ -56,13 +57,31 @@ def get_model_and_auxiliaries(args):
     tokenizer.pad_token = PAD_TOKEN
     tokenizer.eos_token = EOS_TOKEN
 
-    model = SmallCap.from_encoder_decoder_pretrained(encoder_path, decoder_path, use_cbsa=args.use_cbsa,
-                                                     cbsa_num_heads=args.cbsa_num_heads,
-                                                     cbsa_rep_h=args.cbsa_rep_h,
-                                                     cbsa_rep_w=args.cbsa_rep_w,
-                                                     cbsa_cls_pos=args.cbsa_cls_pos,
-                                                     cbsa_dropout=args.cbsa_dropout,
-                                                     cross_attention_reduce_factor=cross_attention_reduce_factor)
+    # ---- load CLIP text encoder & tokenizer (prompt encoder) ----
+    clip_text_tokenizer = CLIPTokenizer.from_pretrained(encoder_path)
+    clip_text_encoder = CLIPTextModel.from_pretrained(encoder_path)
+
+    # freeze text encoder by default (可选)
+    if getattr(args, "freeze_text_encoder", True):
+        for p in clip_text_encoder.parameters():
+            p.requires_grad = False
+
+    # pass text encoder & tokenizer into SmallCap factory
+    model = SmallCap.from_encoder_decoder_pretrained(
+        encoder_path,
+        decoder_path,
+        # === Caption CBSA参数 ===
+        use_cbsa_caption=args.use_cbsa_caption,
+        cbsa_caption_num_heads=args.cbsa_caption_num_heads,
+        cbsa_caption_rep_h=args.cbsa_caption_rep_h,
+        cbsa_caption_rep_w=args.cbsa_caption_rep_w,
+        cbsa_caption_dropout=args.cbsa_caption_dropout,
+        # ===
+        cross_attention_reduce_factor=cross_attention_reduce_factor,
+        text_encoder=clip_text_encoder,
+        text_tokenizer=clip_text_tokenizer
+    )
+
     model.config.vocab_size = model.config.decoder.vocab_size
     model.config.decoder_start_token_id = None
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -98,8 +117,10 @@ def get_model_and_auxiliaries(args):
     print('Training a model with {} trainable parameters.'.format(num_trainable_params))
     cbsa_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'cbsa' in n)
     print(f'CBSA trainable params: {cbsa_params}')
+    cbsa_caption_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'cbsa_caption' in n)
+    print(f'Caption CBSA trainable params: {cbsa_caption_params}')
 
-    return model, tokenizer, feature_extractor
+    return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
 
 def get_data(tokenizer, max_length, args):
@@ -129,7 +150,7 @@ def get_data(tokenizer, max_length, args):
 
 
 def main(args):
-    model, tokenizer, feature_extractor = get_model_and_auxiliaries(args)
+    model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder = get_model_and_auxiliaries(args)
     train_dataset = get_data(tokenizer, model.config.max_length, args)
 
     model_type = 'norag' if args.disable_rag else 'rag'
@@ -139,28 +160,142 @@ def main(args):
         output_dir = '{}_{}M_{}'.format(model_type, args.attention_size, args.decoder_name)
 
     output_dir = os.path.join(args.experiments_dir, output_dir)
-    if args.use_cbsa:
-        output_dir = output_dir + "_cbsa"
+    if args.use_cbsa_caption:
+        output_dir = output_dir + "_cbsa_caption"
+
+    def collate_fn(batch):
+        # batch: list of samples (dict)
+        # extract retrieved_captions (may be list[str] per sample)
+        retrieved = [example.get("retrieved_captions", None) for example in batch]
+        collated = default_data_collator(batch)
+
+        # If retrived is None or rag disabled, keep None
+        if retrieved is None or all(x is None for x in retrieved):
+            collated["retrieved_captions"] = None
+            return collated
+
+        # Encode retrieved captions into CLIP text pooled embeddings (CLS token)
+        # retrieved is list where each item is e.g. ["cap1", "cap2", ...] or None
+        # convert None to empty list
+        retrieved = [r if r is not None else [] for r in retrieved]
+
+        # flatten for tokenization efficiency
+        flat_caps = []
+        idx_map = []  # for reconstructing per-sample groups
+        for caps in retrieved:
+            idx_map.append(len(flat_caps))
+            flat_caps.extend(caps)  # order preserved
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if len(flat_caps) == 0:
+            # nothing to encode
+            collated["retrieved_captions"] = None
+            return collated
+
+        # tokenize and encode in batches
+        toks = clip_text_tokenizer(flat_caps, padding=True, truncation=True, return_tensors="pt")
+        toks = {k: v.to(device) for k, v in toks.items()}
+        with torch.no_grad():
+            out = clip_text_encoder(**toks)
+            # pooled: use CLS token hidden state
+            pooled = out.last_hidden_state[:, 0, :].detach()  # [sum_k, D_text]
+
+        # rebuild per-sample lists and pad to max_k
+        D = pooled.size(-1)
+        batch_caps_emb = []
+        masks = []
+        cur = 0
+        maxk = 0
+        for caps in retrieved:
+            k = len(caps)
+            maxk = max(maxk, k)
+        # if maxk == 0, no captions at all (shouldn't happen due to earlier check)
+        cur = 0
+        for caps in retrieved:
+            k = len(caps)
+            if k > 0:
+                seg = pooled[cur:cur + k]  # [k, D]
+                cur += k
+            else:
+                seg = torch.zeros(0, D, device=device, dtype=pooled.dtype)
+            # pad to maxk
+            if seg.size(0) < maxk:
+                pad = torch.zeros(maxk - seg.size(0), D, device=device, dtype=seg.dtype)
+                seg = torch.cat([seg, pad], dim=0)
+                mask = torch.cat([torch.ones(k, device=device), torch.zeros(maxk - k, device=device)])
+            else:
+                mask = torch.ones(k, device=device)
+            batch_caps_emb.append(seg)  # [maxk, D]
+            masks.append(mask)  # [maxk]
+        # stack into tensors
+        retrieved_tensor = torch.stack(batch_caps_emb, dim=0)  # [B, maxk, D]
+        retrieved_mask = torch.stack(masks, dim=0).long()  # [B, maxk]
+
+        collated["retrieved_captions"] = retrieved_tensor
+        collated["retrieved_captions_mask"] = retrieved_mask
+        return collated
 
     training_args = Seq2SeqTrainingArguments(
-        num_train_epochs=args.n_epochs,
+        output_dir=output_dir,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_steps,
-        learning_rate=args.lr,
-        fp16=True,
-        save_strategy="epoch",
-        save_total_limit=args.n_epochs,
-        logging_strategy="epoch",
-        output_dir=output_dir,
-        overwrite_output_dir=True,
+        num_train_epochs=args.n_epochs,
+        learning_rate=args.lr_decoder,  # keep a fallback; actual optimizer uses param groups
+        weight_decay=args.weight_decay,
+        warmup_steps=args.warmup_steps,
+        fp16=args.fp16,
+        logging_steps=100,
+        save_strategy="steps",
+        save_steps=5000,
+        evaluation_strategy="no",  # 禁用评估
+        # eval_steps=5000,  # 删除或注释掉
+        save_total_limit=5,
+        dataloader_num_workers=4,
+        report_to="none",  # or "wandb" if you use wandb
+    )
+
+    # ============================================================
+    #  参数分组：GPT2 decoder 用高中学习率，FFM/投影 用低学习率
+    # ============================================================
+
+    decoder_params = []
+    fusion_params = []
+    other_params = []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        # GPT2 decoder：学习率需要较大
+        if "decoder" in name:
+            decoder_params.append(p)
+
+        # 融合模块：visual_proj / prompt_proj / adapted_ffm
+        elif "visual_proj" in name or "prompt_proj" in name or "adapted_ffm" in name:
+            fusion_params.append(p)
+
+        # 其他（CBSA、LayerNorm 等）
+        else:
+            other_params.append(p)
+
+    from transformers import AdamW
+
+    optimizer = AdamW(
+        [
+            {"params": decoder_params, "lr": 1e-4},  # GPT2: 大LR
+            {"params": fusion_params, "lr": 3e-5},  # FFM + proj: 小LR
+            {"params": other_params, "lr": 3e-5},  # CBSA + 其他
+        ],
+        weight_decay=0.05,
     )
 
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
-        data_collator=default_data_collator,
+        data_collator=collate_fn,
         train_dataset=train_dataset,
         tokenizer=feature_extractor,
+        optimizers=(optimizer, None),
     )
 
     trainer.train()
@@ -175,7 +310,7 @@ if __name__ == '__main__':
     parser.add_argument("--experiments_dir", type=str, default="experiments/",
                         help="Directory where trained models will be saved")
 
-    parser.add_argument("--encoder_name", type=str, default="openai/clip-vit-base-patch32",
+    parser.add_argument("--encoder_name", type=str, default="clip-vit-base-patch32",
                         help="Encoder name as found of HuggingFace or stored locally")
     parser.add_argument("--decoder_name", type=str, default="gpt2",
                         help="Decoder name as found of HuggingFace or stored locally")
@@ -192,25 +327,32 @@ if __name__ == '__main__':
                         help="JSON file with retrieved captions")
     parser.add_argument("--template_path", type=str, default="src/template.txt", help="TXT file with template")
 
-    parser.add_argument("--n_epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--gradient_steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument("--n_epochs", type=int, default=8, help="Number of training epochs")
+    #    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr_decoder", type=float, default=1e-4, help="Learning rate for GPT2 decoder")
+    parser.add_argument("--lr_fusion", type=float, default=3e-5,
+                        help="Learning rate for fusion modules (FFM, projectors)")
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps for scheduler")
+    parser.add_argument("--fp16", action="store_true", default=True, help="Use fp16 training")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--gradient_steps", type=int, default=2, help="Number of gradient accumulation steps")
 
     parser.add_argument("--ablation_visual", action="store_true", default=False,
                         help="Whether to blank visual features")
 
-    # === CBSA toggles & hparams ===
-    parser.add_argument("--use_cbsa", action="store_true", default=True,
-                        help="Enable Contract-and-Broadcast bridge between encoder and cross-attn")
-    parser.add_argument("--cbsa_num_heads", type=int, default=8,
-                        help="CBSA heads (must divide encoder hidden dim)")
-    parser.add_argument("--cbsa_rep_h", type=int, default=8, help="CBSA representative grid height")
-    parser.add_argument("--cbsa_rep_w", type=int, default=8, help="CBSA representative grid width")
-    parser.add_argument("--cbsa_cls_pos", type=str, default="first",
-                        choices=["first", "last", "none"],
-                        help="CLS token position in encoder sequence (CLIP ViT uses 'first')")
-    parser.add_argument("--cbsa_dropout", type=float, default=0.0, help="CBSA dropout")
+    # === Caption CBSA toggles & hparams ===
+    parser.add_argument("--use_cbsa_caption", action="store_true", default=True,
+                        help="Enable CBSA for caption embedding enhancement")
+    parser.add_argument("--cbsa_caption_num_heads", type=int, default=8,
+                        help="CBSA caption heads (must divide fusion_dim)")
+    parser.add_argument("--cbsa_caption_rep_h", type=int, default=4,
+                        help="CBSA caption representative grid height")
+    parser.add_argument("--cbsa_caption_rep_w", type=int, default=4,
+                        help="CBSA caption representative grid width")
+    parser.add_argument("--cbsa_caption_dropout", type=float, default=0.0,
+                        help="CBSA caption dropout")
 
     args = parser.parse_args()
 

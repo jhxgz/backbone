@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
+from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 from transformers.modeling_utils import PreTrainedModel
@@ -37,6 +38,8 @@ from .xglm import ThisXGLMConfig
 from .opt import ThisOPTForCausalLM
 from .opt import ThisOPTConfig
 from .modules.CBSA import CBSA
+from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
+from .modules.adapted_ffm import AdaptedFFM
 
 
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
@@ -179,6 +182,8 @@ class SmallCap(PreTrainedModel):
             config: Optional[PretrainedConfig] = None,
             encoder: Optional[PreTrainedModel] = None,
             decoder: Optional[PreTrainedModel] = None,
+            text_encoder: Optional[PreTrainedModel] = None,
+            text_tokenizer: Optional[object] = None,
     ):
         if config is None and (encoder is None or decoder is None):
             raise ValueError("Either a configuration or an encoder and a decoder has to be provided.")
@@ -211,25 +216,54 @@ class SmallCap(PreTrainedModel):
         self.encoder = encoder.vision_model
         self.encoder.main_input_name = 'pixel_values'
         self.decoder = decoder
-        # ===> BEGIN: add CBSA bridge (between encoder and decoder cross-attn)  <===
-        self.use_cbsa = getattr(self.config, "use_cbsa", False)
-        if self.use_cbsa:
-            enc_hidden = (
-                self.encoder.config.hidden_size
-                if hasattr(self.encoder.config, "hidden_size")
-                else self.encoder.config.vision_config.hidden_size
-            )
-            self.cbsa = CBSA(
-                dim=enc_hidden,
-                heads=int(getattr(self.config, "cbsa_num_heads", 8)),
+
+        self.text_encoder = text_encoder
+        self.text_tokenizer = text_tokenizer
+
+        # 创建visual_proj / prompt_proj / adapted_ffm
+        enc_hidden = (
+            self.encoder.config.hidden_size
+            if hasattr(self.encoder.config, "hidden_size")
+            else self.encoder.config.vision_config.hidden_size
+        )
+        fusion_dim = getattr(self.config, "fusion_dim", enc_hidden)
+
+        # 图像投影：CLIP vision encoder输出 -> fusion_dim
+        self.visual_proj = CBSAVisionProjector(in_dim=enc_hidden, out_dim=fusion_dim)
+
+        # prompt投影：需要根据text_encoder的hidden_size决定in_dim
+        text_hidden = None
+        if self.text_encoder is not None:
+            try:
+                text_hidden = self.text_encoder.config.hidden_size
+            except:
+                text_hidden = fusion_dim
+
+        if text_hidden is None:
+            text_hidden = fusion_dim
+
+        self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
+
+        # ===> BEGIN: 添加CBSA模块用于caption embedding特征增强 <===
+        self.use_cbsa_caption = getattr(self.config, "use_cbsa_caption", True)
+        if self.use_cbsa_caption:
+            # 为caption embedding创建CBSA模块
+            # 注意：caption是序列数据，CBSA会自动处理非平方数序列（使用1×N网格）
+            self.cbsa_caption = CBSA(
+                dim=fusion_dim,  # 在prompt_proj之后，所以是fusion_dim
+                heads=int(getattr(self.config, "cbsa_caption_num_heads", 8)),
                 dim_head=None,  # 默认自动dim//heads
-                rep_h=int(getattr(self.config, "cbsa_rep_h", 8)),
-                rep_w=int(getattr(self.config, "cbsa_rep_w", 8)),
-                cls_pos=str(getattr(self.config, "cbsa_cls_pos", "first")),  # CLIP：“first”
-                dropout=float(getattr(self.config, "cbsa_dropout", 0.0)),
+                rep_h=int(getattr(self.config, "cbsa_caption_rep_h", 4)),  # caption序列通常较短
+                rep_w=int(getattr(self.config, "cbsa_caption_rep_w", 4)),
+                cls_pos="none",  # caption通常没有CLS token
+                dropout=float(getattr(self.config, "cbsa_caption_dropout", 0.0)),
             )
-            # make sure that the individual model's config refers to the shared config
-        # so that the updates to the config will be synced
+        # ===> END: CBSA caption模块 <===
+
+        # 融合模块
+        self.adapted_ffm = AdaptedFFM(dim=fusion_dim, hidden=max(256, fusion_dim),
+                                      num_heads=getattr(self.config, "ffm_heads", 4), )
+
         self.encoder.config = self.config.encoder
         self.decoder.config = self.config.decoder
 
@@ -428,7 +462,13 @@ class SmallCap(PreTrainedModel):
 
         # make sure input & output embeddings is not tied
         config.tie_word_embeddings = False
-        return cls(encoder=encoder, decoder=decoder, config=config)
+
+        # pull optional text encoder/tokenizer from kwargs (caller can pass them)
+        text_encoder = kwargs.pop("text_encoder", None) if isinstance(kwargs, dict) else None
+        text_tokenizer = kwargs.pop("text_tokenizer", None) if isinstance(kwargs, dict) else None
+
+        return cls(encoder=encoder, decoder=decoder, config=config, text_encoder=text_encoder,
+                   text_tokenizer=text_tokenizer)
 
     def forward(
             self,
@@ -481,7 +521,17 @@ class SmallCap(PreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        kwargs_encoder = {argument: value for argument, value in kwargs.items() if not argument.startswith("decoder_")}
+        # 从kwargs中提取retrieved_captions相关参数（这些不应该传递给encoder）
+        retrieved_caps = kwargs.pop("retrieved_captions", None)
+        retrieved_caps_mask = kwargs.pop("retrieved_captions_mask", None)
+
+        kwargs_encoder = {
+            argument: value 
+            for argument, value in kwargs.items() 
+            if not argument.startswith("decoder_")
+            # 排除retrieved_captions相关参数，它们不应该传递给encoder
+            and argument not in ["retrieved_captions", "retrieved_captions_mask"]
+        }
 
         kwargs_decoder = {
             argument[len("decoder_"):]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
@@ -504,16 +554,52 @@ class SmallCap(PreTrainedModel):
 
         encoder_hidden_states = encoder_outputs[0]
 
-        # >>> 插入CBSA预处理
-        if getattr(self, "use_cbsa", False):
-            encoder_hidden_states = self.cbsa(encoder_hidden_states)
-
-        # else:
         encoder_attention_mask = None
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
             decoder_input_ids = shift_tokens_right(
                 labels, self.config.pad_token_id, self.config.decoder_start_token_id
             )
+
+        # ===== Step 1: 使用CLIP vision encoder生成image embedding并投影 =====
+        # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
+        img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
+
+        # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）
+        # 这些参数已经从 kwargs 中移除，所以这里不再需要获取
+
+        if retrieved_caps is not None and self.text_tokenizer is not None and self.text_encoder is not None:
+            # ===== Step 2: 使用CLIP text encoder生成caption embedding =====
+            # encode_prompts 会接受 tensor 或字符串列表
+            # 返回 prompt_embeds: [B, L, D_text] 以及 attn_mask: [B, L]
+            prompt_embeds, attn_mask = self.encode_prompts(retrieved_caps)
+
+            # 如果外部传入了 retrieved_caps_mask （来自 dataset/collate），优先使用它（按需）
+            if retrieved_caps_mask is not None:
+                # ensure device and dtype
+                retrieved_caps_mask = retrieved_caps_mask.to(
+                    attn_mask.device) if attn_mask is not None else retrieved_caps_mask.to(
+                    next(self.parameters()).device)
+                # 如果 attn_mask 为 None（例如 encode_prompts 返回 pooled only），用 retrieved_caps_mask 作为 attn_mask
+                if attn_mask is None:
+                    attn_mask = retrieved_caps_mask
+                else:
+                    # 两者都存在时，使用按位相与（若需）
+                    attn_mask = (attn_mask.long() & retrieved_caps_mask.long()).long()
+
+            # ===== Step 3: 投影caption embedding到融合维度 =====
+            # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
+            prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
+
+            # ===== Step 4: 使用CBSA模块对caption embedding进行特征增强 =====
+            if getattr(self, "use_cbsa_caption", False):
+                prompt_feats = self.cbsa_caption(prompt_feats)  # [B, L, fusion_dim]
+
+            # ===== Step 5: 使用adapted_ffm对image embedding和增强后的caption embedding进行融合 =====
+            # 调用 AdaptedFFM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
+            img_feats = self.adapted_ffm(img_feats, prompt_feats, prompt_mask=attn_mask)
+
+        # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
+        encoder_hidden_states = img_feats
 
         # Decode
         decoder_outputs = self.decoder(
@@ -571,7 +657,60 @@ class SmallCap(PreTrainedModel):
             "past_key_values": decoder_inputs["past_key_values"],
             "use_cache": use_cache,
         }
+        # 从kwargs中提取retrieved_captions相关参数，传递给forward
+        if "retrieved_captions" in kwargs:
+            input_dict["retrieved_captions"] = kwargs.pop("retrieved_captions")
+        if "retrieved_captions_mask" in kwargs:
+            input_dict["retrieved_captions_mask"] = kwargs.pop("retrieved_captions_mask")
+        # 其他kwargs参数也传递
+        input_dict.update(kwargs)
         return input_dict
+
+    def _prepare_encoder_decoder_kwargs_for_generation(
+            self, input_tensor, model_kwargs, model_input_name=None
+    ):
+        """
+        重写此方法，过滤掉不应传递给encoder的参数（如retrieved_captions）
+        """
+        # 从model_kwargs中提取retrieved_captions相关参数（这些不应该传递给encoder）
+        retrieved_captions = model_kwargs.pop("retrieved_captions", None)
+        retrieved_captions_mask = model_kwargs.pop("retrieved_captions_mask", None)
+        
+        # 调用父类方法（此时model_kwargs已经不包含retrieved_captions了）
+        # 注意：如果父类没有这个方法，我们需要自己实现
+        try:
+            encoder_kwargs = super()._prepare_encoder_decoder_kwargs_for_generation(
+                input_tensor, model_kwargs, model_input_name
+            )
+        except AttributeError:
+            # 如果父类没有这个方法，我们自己实现
+            # 这是从transformers库的generation_utils.py中简化版本
+            if model_input_name is None:
+                model_input_name = self.main_input_name
+            
+            encoder_kwargs = {}
+            if model_input_name in model_kwargs:
+                encoder_kwargs[model_input_name] = model_kwargs.pop(model_input_name)
+            
+            # 过滤掉不应传递给encoder的参数
+            encoder_kwargs.update({
+                k: v for k, v in model_kwargs.items()
+                if k not in ["retrieved_captions", "retrieved_captions_mask", "decoder_input_ids", 
+                            "decoder_attention_mask", "past_key_values", "use_cache"]
+                and not k.startswith("decoder_")
+            })
+        
+        # 将retrieved_captions参数添加回model_kwargs，以便传递给forward
+        if retrieved_captions is not None:
+            model_kwargs["retrieved_captions"] = retrieved_captions
+        if retrieved_captions_mask is not None:
+            model_kwargs["retrieved_captions_mask"] = retrieved_captions_mask
+        
+        # 确保encoder_kwargs不包含这些参数
+        encoder_kwargs.pop("retrieved_captions", None)
+        encoder_kwargs.pop("retrieved_captions_mask", None)
+        
+        return encoder_kwargs
 
     def resize_token_embeddings(self, *args, **kwargs):
         raise NotImplementedError(
@@ -582,3 +721,59 @@ class SmallCap(PreTrainedModel):
     def _reorder_cache(self, past, beam_idx):
         # apply decoder cache reordering here
         return self.decoder._reorder_cache(past, beam_idx)
+
+    def encode_prompts(self, prompt_input):
+        """
+            Accept:
+              - None
+              - list[str] (长度 batch_size) OR list[list[str]] (每个 sample 为多个 retrieved captions)
+              - torch.Tensor of shape [B, K, D_text] (precomputed pooled embeddings) OR [B, D_text]
+            Return:
+              prompt_embeds: torch.Tensor [B, L, D_text]
+              attn_mask: torch.Tensor [B, L] (1 for valid token, 0 for pad) or None if not applicable
+        """
+        if self.text_tokenizer is None or self.text_encoder is None:
+            raise ValueError(
+                "text_tokenizer/text_encoder not set in model. Pass them via from_encoder_decoder_pretrained kwargs."
+            )
+
+        device = next(self.parameters()).device
+
+        # None case
+        if prompt_input is None:
+            return None, None
+
+        # If already tensor: assume pooled or token-level embeddings provided
+        if torch.is_tensor(prompt_input):
+            x = prompt_input.to(device)
+            # if 2D -> [B, D] treat as pooled single prompt per image
+            if x.dim() == 2:
+                x = x.unsqueeze(1)  # [B, 1, D_text]
+                attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
+                return x, attn_mask
+            # if 3D -> [B, K, D_text] already token-level/pool-level per caption
+            if x.dim() == 3:
+                attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
+                return x, attn_mask
+            raise ValueError("Unsupported tensor dim for prompt_input: got dim = %d" % x.dim())
+
+        # Else expect list[str] or list[list[str]]
+        prompt_texts = prompt_input
+        if len(prompt_texts) == 0:
+            return None, None
+
+        # If inner lists (multiple captions per sample), join them into one sequence per sample by default
+        # (alternative: you may want to keep them separate; adjust if needed)
+        if isinstance(prompt_texts[0], (list, tuple)):
+            # join each sample's captions into a single string
+            prompt_texts = [" ".join(p) for p in prompt_texts]
+
+        enc = self.text_tokenizer(prompt_texts, return_tensors="pt", padding=True, truncation=True)
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        # forward through text encoder
+        outputs = self.text_encoder(**enc)
+        prompt_embeds = outputs.last_hidden_state  # [B, L_text, D_text]
+        attn_mask = enc.get("attention_mask", None)
+        return prompt_embeds, attn_mask
+
