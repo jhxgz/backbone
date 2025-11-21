@@ -66,16 +66,16 @@ def get_model_and_auxiliaries(args):
         for p in clip_text_encoder.parameters():
             p.requires_grad = False
 
+    use_ar_adapter = not getattr(args, "disable_ar_adapter", False)
     # pass text encoder & tokenizer into SmallCap factory
     model = SmallCap.from_encoder_decoder_pretrained(
         encoder_path,
         decoder_path,
-        # === Caption CBSA参数 ===
-        use_cbsa_caption=args.use_cbsa_caption,
-        cbsa_caption_num_heads=args.cbsa_caption_num_heads,
-        cbsa_caption_rep_h=args.cbsa_caption_rep_h,
-        cbsa_caption_rep_w=args.cbsa_caption_rep_w,
-        cbsa_caption_dropout=args.cbsa_caption_dropout,
+        # === AR 图像增强参数 ===
+        use_ar_adapter=use_ar_adapter,
+        ar_down_ratio=args.ar_down_ratio,
+        ar_dropout=args.ar_dropout,
+        ar_use_gate=not args.disable_ar_gate,
         # ===
         cross_attention_reduce_factor=cross_attention_reduce_factor,
         text_encoder=clip_text_encoder,
@@ -115,10 +115,12 @@ def get_model_and_auxiliaries(args):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     num_trainable_params = sum([np.prod(p.size()) for p in model_parameters])
     print('Training a model with {} trainable parameters.'.format(num_trainable_params))
-    cbsa_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'cbsa' in n)
-    print(f'CBSA trainable params: {cbsa_params}')
-    cbsa_caption_params = sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and 'cbsa_caption' in n)
-    print(f'Caption CBSA trainable params: {cbsa_caption_params}')
+    ar_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'image_ar_adapter' in n
+    )
+    print(f'AR adapter trainable params: {ar_params}')
 
     return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
@@ -160,8 +162,9 @@ def main(args):
         output_dir = '{}_{}M_{}'.format(model_type, args.attention_size, args.decoder_name)
 
     output_dir = os.path.join(args.experiments_dir, output_dir)
-    if args.use_cbsa_caption:
-        output_dir = output_dir + "_cbsa_caption"
+    use_ar_adapter = not args.disable_ar_adapter
+    if use_ar_adapter:
+        output_dir = output_dir + "_ar"
 
     def collate_fn(batch):
         # batch: list of samples (dict)
@@ -236,57 +239,16 @@ def main(args):
         return collated
 
     training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,
+        num_train_epochs=args.n_epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_steps,
-        num_train_epochs=args.n_epochs,
-        learning_rate=args.lr_decoder,  # keep a fallback; actual optimizer uses param groups
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        fp16=args.fp16,
-        logging_steps=100,
-        save_strategy="steps",
-        save_steps=5000,
-        evaluation_strategy="no",  # 禁用评估
-        # eval_steps=5000,  # 删除或注释掉
-        save_total_limit=5,
-        dataloader_num_workers=4,
-        report_to="none",  # or "wandb" if you use wandb
-    )
-
-    # ============================================================
-    #  参数分组：GPT2 decoder 用高中学习率，FFM/投影 用低学习率
-    # ============================================================
-
-    decoder_params = []
-    fusion_params = []
-    other_params = []
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-
-        # GPT2 decoder：学习率需要较大
-        if "decoder" in name:
-            decoder_params.append(p)
-
-        # 融合模块：visual_proj / prompt_proj / adapted_ffm
-        elif "visual_proj" in name or "prompt_proj" in name or "adapted_ffm" in name:
-            fusion_params.append(p)
-
-        # 其他（CBSA、LayerNorm 等）
-        else:
-            other_params.append(p)
-
-    from transformers import AdamW
-
-    optimizer = AdamW(
-        [
-            {"params": decoder_params, "lr": 1e-4},  # GPT2: 大LR
-            {"params": fusion_params, "lr": 3e-5},  # FFM + proj: 小LR
-            {"params": other_params, "lr": 3e-5},  # CBSA + 其他
-        ],
-        weight_decay=0.05,
+        learning_rate=args.lr,
+        fp16=True,
+        save_strategy="epoch",
+        save_total_limit=args.n_epochs,
+        logging_strategy="epoch",
+        output_dir=output_dir,
+        overwrite_output_dir=True,
     )
 
     trainer = Seq2SeqTrainer(
@@ -295,7 +257,6 @@ def main(args):
         data_collator=collate_fn,
         train_dataset=train_dataset,
         tokenizer=feature_extractor,
-        optimizers=(optimizer, None),
     )
 
     trainer.train()
@@ -327,32 +288,22 @@ if __name__ == '__main__':
                         help="JSON file with retrieved captions")
     parser.add_argument("--template_path", type=str, default="src/template.txt", help="TXT file with template")
 
-    parser.add_argument("--n_epochs", type=int, default=8, help="Number of training epochs")
-    #    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--lr_decoder", type=float, default=1e-4, help="Learning rate for GPT2 decoder")
-    parser.add_argument("--lr_fusion", type=float, default=3e-5,
-                        help="Learning rate for fusion modules (FFM, projectors)")
-    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps for scheduler")
-    parser.add_argument("--fp16", action="store_true", default=True, help="Use fp16 training")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--gradient_steps", type=int, default=2, help="Number of gradient accumulation steps")
+    parser.add_argument("--n_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--gradient_steps", type=int, default=1, help="Number of gradient accumulation steps")
 
     parser.add_argument("--ablation_visual", action="store_true", default=False,
                         help="Whether to blank visual features")
+    parser.add_argument("--disable_ar_adapter", action="store_true", default=False,
+                        help="Disable AR adapter enhancement on visual tokens")
+    parser.add_argument("--ar_down_ratio", type=int, default=4,
+                        help="Bottleneck ratio for AR adapter hidden size")
+    parser.add_argument("--ar_dropout", type=float, default=0.1,
+                        help="Dropout rate inside AR adapter")
+    parser.add_argument("--disable_ar_gate", action="store_true", default=False,
+                        help="Disable learnable gate inside AR adapter")
 
-    # === Caption CBSA toggles & hparams ===
-    parser.add_argument("--use_cbsa_caption", action="store_true", default=True,
-                        help="Enable CBSA for caption embedding enhancement")
-    parser.add_argument("--cbsa_caption_num_heads", type=int, default=8,
-                        help="CBSA caption heads (must divide fusion_dim)")
-    parser.add_argument("--cbsa_caption_rep_h", type=int, default=4,
-                        help="CBSA caption representative grid height")
-    parser.add_argument("--cbsa_caption_rep_w", type=int, default=4,
-                        help="CBSA caption representative grid width")
-    parser.add_argument("--cbsa_caption_dropout", type=float, default=0.0,
-                        help="CBSA caption dropout")
 
     args = parser.parse_args()
 

@@ -37,7 +37,7 @@ from .xglm import ThisXGLMForCausalLM
 from .xglm import ThisXGLMConfig
 from .opt import ThisOPTForCausalLM
 from .opt import ThisOPTConfig
-from .modules.CBSA import CBSA
+from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
 from .modules.adapted_ffm import AdaptedFFM
 
@@ -244,21 +244,16 @@ class SmallCap(PreTrainedModel):
 
         self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
 
-        # ===> BEGIN: 添加CBSA模块用于caption embedding特征增强 <===
-        self.use_cbsa_caption = getattr(self.config, "use_cbsa_caption", True)
-        if self.use_cbsa_caption:
-            # 为caption embedding创建CBSA模块
-            # 注意：caption是序列数据，CBSA会自动处理非平方数序列（使用1×N网格）
-            self.cbsa_caption = CBSA(
-                dim=fusion_dim,  # 在prompt_proj之后，所以是fusion_dim
-                heads=int(getattr(self.config, "cbsa_caption_num_heads", 8)),
-                dim_head=None,  # 默认自动dim//heads
-                rep_h=int(getattr(self.config, "cbsa_caption_rep_h", 4)),  # caption序列通常较短
-                rep_w=int(getattr(self.config, "cbsa_caption_rep_w", 4)),
-                cls_pos="none",  # caption通常没有CLS token
-                dropout=float(getattr(self.config, "cbsa_caption_dropout", 0.0)),
+        # ===> BEGIN: 添加AR模块用于图像特征增强 <===
+        self.use_ar_adapter = getattr(self.config, "use_ar_adapter", True)
+        if self.use_ar_adapter:
+            self.image_ar_adapter = AdapterResidual(
+                dim=fusion_dim,
+                down_ratio=int(getattr(self.config, "ar_down_ratio", 4)),
+                dropout=float(getattr(self.config, "ar_dropout", 0.1)),
+                use_gate=bool(getattr(self.config, "ar_use_gate", True)),
             )
-        # ===> END: CBSA caption模块 <===
+        # ===> END: AR 图像增强模块 <===
 
         # 融合模块
         self.adapted_ffm = AdaptedFFM(dim=fusion_dim, hidden=max(256, fusion_dim),
@@ -457,15 +452,19 @@ class SmallCap(PreTrainedModel):
             else:
                 decoder = ThisGPT2LMHeadModel.from_pretrained(decoder_pretrained_model_name_or_path, **kwargs_decoder)
 
+        # pull optional text encoder/tokenizer from kwargs before building config
+        if isinstance(kwargs, dict):
+            text_encoder = kwargs.pop("text_encoder", None)
+            text_tokenizer = kwargs.pop("text_tokenizer", None)
+        else:
+            text_encoder = None
+            text_tokenizer = None
+
         # instantiate config with corresponding kwargs
         config = SmallCapConfig.from_encoder_decoder_configs(encoder.config, decoder.config, **kwargs)
 
         # make sure input & output embeddings is not tied
         config.tie_word_embeddings = False
-
-        # pull optional text encoder/tokenizer from kwargs (caller can pass them)
-        text_encoder = kwargs.pop("text_encoder", None) if isinstance(kwargs, dict) else None
-        text_tokenizer = kwargs.pop("text_tokenizer", None) if isinstance(kwargs, dict) else None
 
         return cls(encoder=encoder, decoder=decoder, config=config, text_encoder=text_encoder,
                    text_tokenizer=text_tokenizer)
@@ -564,11 +563,15 @@ class SmallCap(PreTrainedModel):
         # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
         img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
 
+        # ===== Step 2: 使用AR模块增强图像特征 =====
+        if getattr(self, "use_ar_adapter", False):
+            img_feats = img_feats + self.image_ar_adapter(img_feats)
+
         # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）
         # 这些参数已经从 kwargs 中移除，所以这里不再需要获取
 
         if retrieved_caps is not None and self.text_tokenizer is not None and self.text_encoder is not None:
-            # ===== Step 2: 使用CLIP text encoder生成caption embedding =====
+            # ===== Step 3: 使用CLIP text encoder生成caption embedding =====
             # encode_prompts 会接受 tensor 或字符串列表
             # 返回 prompt_embeds: [B, L, D_text] 以及 attn_mask: [B, L]
             prompt_embeds, attn_mask = self.encode_prompts(retrieved_caps)
@@ -586,15 +589,11 @@ class SmallCap(PreTrainedModel):
                     # 两者都存在时，使用按位相与（若需）
                     attn_mask = (attn_mask.long() & retrieved_caps_mask.long()).long()
 
-            # ===== Step 3: 投影caption embedding到融合维度 =====
+            # ===== Step 4: 投影caption embedding到融合维度 =====
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
-            # ===== Step 4: 使用CBSA模块对caption embedding进行特征增强 =====
-            if getattr(self, "use_cbsa_caption", False):
-                prompt_feats = self.cbsa_caption(prompt_feats)  # [B, L, fusion_dim]
-
-            # ===== Step 5: 使用adapted_ffm对image embedding和增强后的caption embedding进行融合 =====
+            # ===== Step 5: 使用adapted_ffm对image embedding和caption embedding进行融合 =====
             # 调用 AdaptedFFM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
             img_feats = self.adapted_ffm(img_feats, prompt_feats, prompt_mask=attn_mask)
 
