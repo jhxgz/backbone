@@ -39,7 +39,7 @@ from .opt import ThisOPTForCausalLM
 from .opt import ThisOPTConfig
 from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
-from .modules.adapted_ffm import AdaptedFFM
+from .modules.Film import FiLMTokenizerFusion
 from .modules.dual_path_refiner import DualPathRefiner
 
 
@@ -221,7 +221,7 @@ class SmallCap(PreTrainedModel):
         self.text_encoder = text_encoder
         self.text_tokenizer = text_tokenizer
 
-        # 创建visual_proj / prompt_proj / adapted_ffm
+        # 创建visual_proj / prompt_proj / film_fusion
         enc_hidden = (
             self.encoder.config.hidden_size
             if hasattr(self.encoder.config, "hidden_size")
@@ -277,9 +277,20 @@ class SmallCap(PreTrainedModel):
             )
         # ===> END: AR 图像增强模块 <===
 
-        # 融合模块
-        self.adapted_ffm = AdaptedFFM(dim=fusion_dim, hidden=max(256, fusion_dim),
-                                      num_heads=getattr(self.config, "ffm_heads", 4), )
+        # 融合模块 - 使用FiLM替换adapted_ffm
+        film_hidden = getattr(self.config, "film_hidden", None)
+        if film_hidden is None:
+            film_hidden = max(256, fusion_dim)
+        self.film_fusion = FiLMTokenizerFusion(
+            dim=fusion_dim,
+            text_dim=fusion_dim,
+            hidden=film_hidden,
+            per_token=getattr(self.config, "film_per_token", False),
+            use_residual=getattr(self.config, "film_use_residual", True),
+            init_alpha=float(getattr(self.config, "film_init_alpha", 0.1)),
+            text_pool=getattr(self.config, "film_text_pool", "mean"),
+            dropout=float(getattr(self.config, "film_dropout", 0.0))
+        )
 
         self.encoder.config = self.config.encoder
         self.decoder.config = self.config.decoder
@@ -619,9 +630,11 @@ class SmallCap(PreTrainedModel):
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
-            # ===== Step 5: 使用adapted_ffm对image embedding和caption embedding进行融合 =====
-            # 调用 AdaptedFFM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
-            img_feats = self.adapted_ffm(img_feats, prompt_feats, prompt_mask=attn_mask)
+            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合 =====
+            # 调用 FiLM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
+            # FiLM接受image_tokens和text_feats，text_feats可以是[B, L, C]或[B, C]
+            # 如果attn_mask存在，可以在pool之前应用mask（FiLM内部会做mean pooling）
+            img_feats = self.film_fusion(img_feats, prompt_feats)
 
         # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
         encoder_hidden_states = img_feats

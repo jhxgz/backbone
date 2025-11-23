@@ -102,6 +102,17 @@ def get_model_and_auxiliaries(args):
     model.config.max_length = CAPTION_LENGTH
     model.config.rag = not args.disable_rag
 
+    # === FiLM 融合模块配置 ===
+    model.config.film_per_token = args.film_per_token
+    # film_use_residual: 如果指定了--disable_film_residual则为False，否则为True（默认）
+    model.config.film_use_residual = not args.disable_film_residual
+    model.config.film_init_alpha = args.film_init_alpha
+    model.config.film_text_pool = args.film_text_pool
+    model.config.film_dropout = args.film_dropout
+    if args.film_hidden is not None:
+        model.config.film_hidden = args.film_hidden
+    # === FiLM 融合模块配置结束 ===
+
     # print("model",model)
     # print(stop)
     # freeze parameters
@@ -140,14 +151,14 @@ def get_model_and_auxiliaries(args):
     if dual_path_params > 0:
         print(f'DualPathRefiner trainable params: {dual_path_params}')
     
-    # 统计 AdaptedFFM 模块的可训练参数
-    adapted_ffm_params = sum(
+    # 统计 FiLM 融合模块的可训练参数
+    film_fusion_params = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if p.requires_grad and 'adapted_ffm' in n
+        if p.requires_grad and 'film_fusion' in n
     )
-    if adapted_ffm_params > 0:
-        print(f'AdaptedFFM trainable params: {adapted_ffm_params}')
+    if film_fusion_params > 0:
+        print(f'FiLM fusion trainable params: {film_fusion_params}')
 
     return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
@@ -182,21 +193,29 @@ def main(args):
     model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder = get_model_and_auxiliaries(args)
     train_dataset = get_data(tokenizer, model.config.max_length, args)
 
-    model_type = 'norag' if args.disable_rag else 'rag'
-    if args.ablation_visual:
-        output_dir = '{}_{}M_{}_ablation'.format(model_type, args.attention_size, args.decoder_name)
+    # 如果用户指定了自定义输出目录名称，直接使用
+    if args.output_dir_name:
+        output_dir = os.path.join(args.experiments_dir, args.output_dir_name)
     else:
-        output_dir = '{}_{}M_{}'.format(model_type, args.attention_size, args.decoder_name)
+        # 自动生成输出目录名称
+        model_type = 'norag' if args.disable_rag else 'rag'
+        if args.ablation_visual:
+            output_dir = '{}_{}M_{}_ablation'.format(model_type, args.attention_size, args.decoder_name)
+        else:
+            output_dir = '{}_{}M_{}'.format(model_type, args.attention_size, args.decoder_name)
 
-    output_dir = os.path.join(args.experiments_dir, output_dir)
-    use_ar_adapter = not args.disable_ar_adapter
-    use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
-    
-    # 根据使用的增强模块添加路径标识
-    if use_dual_path_refiner:
-        output_dir = output_dir + "_dualpath"
-    elif use_ar_adapter:
-        output_dir = output_dir + "_ar"
+        output_dir = os.path.join(args.experiments_dir, output_dir)
+        use_ar_adapter = not args.disable_ar_adapter
+        use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
+        
+        # 根据使用的增强模块添加路径标识
+        if use_dual_path_refiner:
+            output_dir = output_dir + "_dualpath"
+        elif use_ar_adapter:
+            output_dir = output_dir + "_ar"
+        
+        # 添加FiLM标识（因为现在默认使用FiLM替换了adapted_ffm）
+        output_dir = output_dir + "_film"
 
     def collate_fn(batch):
         # batch: list of samples (dict)
@@ -350,6 +369,26 @@ if __name__ == '__main__':
     parser.add_argument("--apr_dropout", type=float, default=0.1,
                         help="Dropout rate inside AttentionPoolingRefiner")
     # === 双路径增强模块参数结束 ===
+
+    # === FiLM 融合模块参数 ===
+    parser.add_argument("--film_per_token", action="store_true", default=False,
+                        help="Enable per-token FiLM modulation (default: False, global channel-wise)")
+    parser.add_argument("--disable_film_residual", action="store_true", default=False,
+                        help="Disable residual connection in FiLM (default: residual enabled)")
+    parser.add_argument("--film_init_alpha", type=float, default=0.1,
+                        help="Initial value for residual scaling factor in FiLM (default: 0.1)")
+    parser.add_argument("--film_text_pool", type=str, default="mean", choices=["mean", "cls"],
+                        help="Text feature pooling method for FiLM: 'mean' or 'cls' (default: mean)")
+    parser.add_argument("--film_dropout", type=float, default=0.0,
+                        help="Dropout rate in FiLM MLP (default: 0.0)")
+    parser.add_argument("--film_hidden", type=int, default=None,
+                        help="Hidden dimension for FiLM MLP (default: max(256, fusion_dim))")
+    # === FiLM 融合模块参数结束 ===
+
+    # === 输出路径配置 ===
+    parser.add_argument("--output_dir_name", type=str, default=None,
+                        help="Custom output directory name (if not specified, will auto-generate based on model config)")
+    # === 输出路径配置结束 ===
 
 
     args = parser.parse_args()
