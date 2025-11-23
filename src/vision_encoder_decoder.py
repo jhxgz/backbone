@@ -40,6 +40,7 @@ from .opt import ThisOPTConfig
 from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
 from .modules.adapted_ffm import AdaptedFFM
+from .modules.dual_path_refiner import DualPathRefiner
 
 
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
@@ -244,7 +245,28 @@ class SmallCap(PreTrainedModel):
 
         self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
 
-        # ===> BEGIN: 添加AR模块用于图像特征增强 <===
+        # ===> BEGIN: 添加双路径增强模块 (DualPathRefiner) <===
+        # 在 CLIP image encoder 输出后使用双路径增强模块
+        self.use_dual_path_refiner = getattr(self.config, "use_dual_path_refiner", False)
+        if self.use_dual_path_refiner:
+            self.dual_path_refiner = DualPathRefiner(
+                dim=fusion_dim,
+                # AdapterResidual 参数
+                adapter_down_ratio=int(getattr(self.config, "ar_down_ratio", 4)),
+                adapter_dropout=float(getattr(self.config, "ar_dropout", 0.1)),
+                adapter_use_gate=bool(getattr(self.config, "ar_use_gate", True)),
+                # AttentionPoolingRefiner 参数
+                apr_n_queries=int(getattr(self.config, "apr_n_queries", 1)),
+                apr_n_heads=int(getattr(self.config, "apr_n_heads", 8)),
+                apr_proj_back=bool(getattr(self.config, "apr_proj_back", True)),
+                apr_dropout=float(getattr(self.config, "apr_dropout", 0.1)),
+                # 双路径权重参数
+                alpha1_init=float(getattr(self.config, "dual_path_init_alpha", 0.1)),
+                alpha2_init=float(getattr(self.config, "dual_path_init_alpha", 0.1)),
+            )
+        # ===> END: 双路径增强模块 <===
+
+        # ===> BEGIN: 添加AR模块用于图像特征增强（保留原有功能，可选） <===
         self.use_ar_adapter = getattr(self.config, "use_ar_adapter", True)
         if self.use_ar_adapter:
             self.image_ar_adapter = AdapterResidual(
@@ -563,8 +585,12 @@ class SmallCap(PreTrainedModel):
         # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
         img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
 
-        # ===== Step 2: 使用AR模块增强图像特征 =====
-        if getattr(self, "use_ar_adapter", False):
+        # ===== Step 2: 使用双路径增强模块增强图像特征 =====
+        if getattr(self, "use_dual_path_refiner", False):
+            img_feats = self.dual_path_refiner(img_feats)  # [B, N, fusion_dim]
+
+        # ===== Step 3: 使用AR模块增强图像特征（如果双路径模块未启用，则使用此路径） =====
+        if getattr(self, "use_ar_adapter", False) and not getattr(self, "use_dual_path_refiner", False):
             img_feats = img_feats + self.image_ar_adapter(img_feats)
 
         # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）

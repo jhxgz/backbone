@@ -192,6 +192,14 @@ def load_model(args, checkpoint_path):
                 model.prompt_proj.ln.bias.data = state_dict['prompt_proj.ln.bias'].clone()
             print("prompt_proj权重已从检查点加载")
     
+    # 显示模型使用的增强模块信息
+    use_dual_path = getattr(config, "use_dual_path_refiner", False)
+    use_ar_adapter = getattr(config, "use_ar_adapter", True)
+    if use_dual_path:
+        print("✓ 模型使用了双路径增强模块 (DualPathRefiner)")
+    elif use_ar_adapter:
+        print("✓ 模型使用了 AR adapter 增强模块")
+    
     # move both model and text encoder to device
     clip_text_encoder.to(args.device)
     model.to(args.device)

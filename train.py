@@ -67,6 +67,7 @@ def get_model_and_auxiliaries(args):
             p.requires_grad = False
 
     use_ar_adapter = not getattr(args, "disable_ar_adapter", False)
+    use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
     # pass text encoder & tokenizer into SmallCap factory
     model = SmallCap.from_encoder_decoder_pretrained(
         encoder_path,
@@ -76,6 +77,14 @@ def get_model_and_auxiliaries(args):
         ar_down_ratio=args.ar_down_ratio,
         ar_dropout=args.ar_dropout,
         ar_use_gate=not args.disable_ar_gate,
+        # ===
+        # === 双路径增强模块参数 ===
+        use_dual_path_refiner=use_dual_path_refiner,
+        dual_path_init_alpha=getattr(args, "dual_path_init_alpha", 0.1),
+        apr_n_queries=getattr(args, "apr_n_queries", 1),
+        apr_n_heads=getattr(args, "apr_n_heads", 8),
+        apr_proj_back=getattr(args, "apr_proj_back", True),
+        apr_dropout=getattr(args, "apr_dropout", 0.1),
         # ===
         cross_attention_reduce_factor=cross_attention_reduce_factor,
         text_encoder=clip_text_encoder,
@@ -121,6 +130,24 @@ def get_model_and_auxiliaries(args):
         if p.requires_grad and 'image_ar_adapter' in n
     )
     print(f'AR adapter trainable params: {ar_params}')
+    
+    # 统计双路径增强模块的可训练参数
+    dual_path_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'dual_path_refiner' in n
+    )
+    if dual_path_params > 0:
+        print(f'DualPathRefiner trainable params: {dual_path_params}')
+    
+    # 统计 AdaptedFFM 模块的可训练参数
+    adapted_ffm_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'adapted_ffm' in n
+    )
+    if adapted_ffm_params > 0:
+        print(f'AdaptedFFM trainable params: {adapted_ffm_params}')
 
     return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
@@ -163,7 +190,12 @@ def main(args):
 
     output_dir = os.path.join(args.experiments_dir, output_dir)
     use_ar_adapter = not args.disable_ar_adapter
-    if use_ar_adapter:
+    use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
+    
+    # 根据使用的增强模块添加路径标识
+    if use_dual_path_refiner:
+        output_dir = output_dir + "_dualpath"
+    elif use_ar_adapter:
         output_dir = output_dir + "_ar"
 
     def collate_fn(batch):
@@ -303,6 +335,21 @@ if __name__ == '__main__':
                         help="Dropout rate inside AR adapter")
     parser.add_argument("--disable_ar_gate", action="store_true", default=False,
                         help="Disable learnable gate inside AR adapter")
+
+    # === 双路径增强模块 (DualPathRefiner) 参数 ===
+    parser.add_argument("--use_dual_path_refiner", action="store_true", default=False,
+                        help="Enable dual path refiner (LayerNorm + AdapterResidual + AttentionPoolingRefiner)")
+    parser.add_argument("--dual_path_init_alpha", type=float, default=0.1,
+                        help="Initial value for alpha1 and alpha2 (dual path weights)")
+    parser.add_argument("--apr_n_queries", type=int, default=1,
+                        help="Number of queries for AttentionPoolingRefiner")
+    parser.add_argument("--apr_n_heads", type=int, default=8,
+                        help="Number of attention heads for AttentionPoolingRefiner")
+    parser.add_argument("--apr_proj_back", action="store_true", default=True,
+                        help="Whether to project back to token space in AttentionPoolingRefiner")
+    parser.add_argument("--apr_dropout", type=float, default=0.1,
+                        help="Dropout rate inside AttentionPoolingRefiner")
+    # === 双路径增强模块参数结束 ===
 
 
     args = parser.parse_args()
