@@ -41,6 +41,7 @@ from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
 from .modules.Film import FiLMTokenizerFusion
 from .modules.dual_path_refiner import DualPathRefiner
+from .modules.TAR import TextAdapterResidual
 
 
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
@@ -244,6 +245,20 @@ class SmallCap(PreTrainedModel):
             text_hidden = fusion_dim
 
         self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
+
+        # ===> BEGIN: 添加TAR模块用于增强text encoder输出的文本特征 <===
+        self.use_tar_module = getattr(self.config, "use_tar_module", True)
+        if self.use_tar_module and self.text_encoder is not None:
+            self.tar_module = TextAdapterResidual(
+                dim=text_hidden,
+                down_ratio=int(getattr(self.config, "tar_down_ratio", 8)),
+                dropout=float(getattr(self.config, "tar_dropout", 0.1)),
+                use_gate=bool(getattr(self.config, "tar_use_gate", True)),
+                init_gate=float(getattr(self.config, "tar_init_gate", -2.0)),
+            )
+        else:
+            self.tar_module = None
+        # ===> END: TAR模块 <===
 
         # ===> BEGIN: 添加双路径增强模块 (DualPathRefiner) <===
         # 在 CLIP image encoder 输出后使用双路径增强模块
@@ -630,11 +645,17 @@ class SmallCap(PreTrainedModel):
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
-            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合 =====
-            # 调用 FiLM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
+            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合，生成视觉提示 =====
+            # 保存融合前的图像特征
+            img_feats_before_fusion = img_feats
+            
+            # 调用 FiLM 进行跨模态融合，得到视觉提示（visual prompt）[B, N, fusion_dim]
             # FiLM接受image_tokens和text_feats，text_feats可以是[B, L, C]或[B, C]
             # 如果attn_mask存在，可以在pool之前应用mask（FiLM内部会做mean pooling）
-            img_feats = self.film_fusion(img_feats, prompt_feats)
+            visual_prompt = self.film_fusion(img_feats, prompt_feats)  # 视觉提示
+            
+            # 将视觉提示与原始图像特征简单求和，得到更精确的视觉特征
+            img_feats = img_feats_before_fusion + visual_prompt
 
         # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
         encoder_hidden_states = img_feats
@@ -812,6 +833,12 @@ class SmallCap(PreTrainedModel):
         # forward through text encoder
         outputs = self.text_encoder(**enc)
         prompt_embeds = outputs.last_hidden_state  # [B, L_text, D_text]
+        
+        # ===> BEGIN: 使用TAR模块增强text encoder输出的文本特征 <===
+        if self.tar_module is not None:
+            prompt_embeds = self.tar_module(prompt_embeds)  # [B, L_text, D_text]
+        # ===> END: TAR模块增强 <===
+        
         attn_mask = enc.get("attention_mask", None)
         return prompt_embeds, attn_mask
 

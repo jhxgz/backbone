@@ -80,11 +80,18 @@ def get_model_and_auxiliaries(args):
         # ===
         # === 双路径增强模块参数 ===
         use_dual_path_refiner=use_dual_path_refiner,
-        dual_path_init_alpha=getattr(args, "dual_path_init_alpha", 0.1),
-        apr_n_queries=getattr(args, "apr_n_queries", 1),
-        apr_n_heads=getattr(args, "apr_n_heads", 8),
-        apr_proj_back=getattr(args, "apr_proj_back", True),
-        apr_dropout=getattr(args, "apr_dropout", 0.1),
+        dual_path_init_alpha=args.dual_path_init_alpha,
+        apr_n_queries=args.apr_n_queries,
+        apr_n_heads=args.apr_n_heads,
+        apr_proj_back=args.apr_proj_back,
+        apr_dropout=args.apr_dropout,
+        # ===
+        # === TAR模块参数 ===
+        use_tar_module=not args.disable_tar_module,
+        tar_down_ratio=args.tar_down_ratio,
+        tar_dropout=args.tar_dropout,
+        tar_use_gate=not args.disable_tar_gate,
+        tar_init_gate=args.tar_init_gate,
         # ===
         cross_attention_reduce_factor=cross_attention_reduce_factor,
         text_encoder=clip_text_encoder,
@@ -112,6 +119,14 @@ def get_model_and_auxiliaries(args):
     if args.film_hidden is not None:
         model.config.film_hidden = args.film_hidden
     # === FiLM 融合模块配置结束 ===
+
+    # === TAR模块配置 ===
+    model.config.use_tar_module = not args.disable_tar_module
+    model.config.tar_down_ratio = args.tar_down_ratio
+    model.config.tar_dropout = args.tar_dropout
+    model.config.tar_use_gate = not args.disable_tar_gate
+    model.config.tar_init_gate = args.tar_init_gate
+    # === TAR模块配置结束 ===
 
     # print("model",model)
     # print(stop)
@@ -159,6 +174,15 @@ def get_model_and_auxiliaries(args):
     )
     if film_fusion_params > 0:
         print(f'FiLM fusion trainable params: {film_fusion_params}')
+    
+    # 统计 TAR 模块的可训练参数
+    tar_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'tar_module' in n
+    )
+    if tar_params > 0:
+        print(f'TAR module trainable params: {tar_params}')
 
     return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
@@ -206,13 +230,18 @@ def main(args):
 
         output_dir = os.path.join(args.experiments_dir, output_dir)
         use_ar_adapter = not args.disable_ar_adapter
-        use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
+        use_dual_path_refiner = args.use_dual_path_refiner
+        use_tar_module = not args.disable_tar_module
         
         # 根据使用的增强模块添加路径标识
         if use_dual_path_refiner:
             output_dir = output_dir + "_dualpath"
         elif use_ar_adapter:
             output_dir = output_dir + "_ar"
+        
+        # 添加TAR模块标识
+        if use_tar_module:
+            output_dir = output_dir + "_tar"
         
         # 添加FiLM标识（因为现在默认使用FiLM替换了adapted_ffm）
         output_dir = output_dir + "_film"
@@ -384,6 +413,19 @@ if __name__ == '__main__':
     parser.add_argument("--film_hidden", type=int, default=None,
                         help="Hidden dimension for FiLM MLP (default: max(256, fusion_dim))")
     # === FiLM 融合模块参数结束 ===
+
+    # === TAR模块参数 ===
+    parser.add_argument("--disable_tar_module", action="store_true", default=False,
+                        help="Disable TAR module enhancement on text encoder outputs")
+    parser.add_argument("--tar_down_ratio", type=int, default=8,
+                        help="Bottleneck ratio for TAR module hidden size (default: 8)")
+    parser.add_argument("--tar_dropout", type=float, default=0.1,
+                        help="Dropout rate inside TAR module (default: 0.1)")
+    parser.add_argument("--disable_tar_gate", action="store_true", default=False,
+                        help="Disable learnable gate inside TAR module")
+    parser.add_argument("--tar_init_gate", type=float, default=-2.0,
+                        help="Initial value for gate parameter in TAR module (default: -2.0)")
+    # === TAR模块参数结束 ===
 
     # === 输出路径配置 ===
     parser.add_argument("--output_dir_name", type=str, default=None,
