@@ -645,17 +645,11 @@ class SmallCap(PreTrainedModel):
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
-            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合，生成视觉提示 =====
-            # 保存融合前的图像特征
-            img_feats_before_fusion = img_feats
-            
-            # 调用 FiLM 进行跨模态融合，得到视觉提示（visual prompt）[B, N, fusion_dim]
+            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合 =====
+            # 调用 FiLM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
             # FiLM接受image_tokens和text_feats，text_feats可以是[B, L, C]或[B, C]
             # 如果attn_mask存在，可以在pool之前应用mask（FiLM内部会做mean pooling）
-            visual_prompt = self.film_fusion(img_feats, prompt_feats)  # 视觉提示
-            
-            # 将视觉提示与原始图像特征简单求和，得到更精确的视觉特征
-            img_feats = img_feats_before_fusion + visual_prompt
+            img_feats = self.film_fusion(img_feats, prompt_feats)
 
         # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
         encoder_hidden_states = img_feats
