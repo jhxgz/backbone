@@ -3,6 +3,7 @@ import numpy as np
 import os
 import argparse
 import datetime
+import torch
 
 os.environ["WANDB_DISABLED"] = "true"
 
@@ -10,6 +11,7 @@ from transformers.models.auto.configuration_auto import AutoConfig
 from transformers import AutoTokenizer, CLIPFeatureExtractor, AutoModel, AutoModelForCausalLM
 from transformers import Seq2SeqTrainer, default_data_collator, Seq2SeqTrainingArguments
 from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import TrainerCallback  # [新增] 导入 TrainerCallback
 
 from transformers import VisionEncoderDecoderModel, CLIPModel, CLIPVisionModel, EncoderDecoderModel
 from src.vision_encoder_decoder import SmallCap, SmallCapConfig
@@ -25,6 +27,38 @@ PARAMS2REDUCE_FACTOR = {28: 1, 14: 2, 7: 4, 3.5: 8, 1.75: 16}
 PAD_TOKEN = '!'
 EOS_TOKEN = '.'
 CAPTION_LENGTH = 25
+
+
+# [新增] 辅助损失调度器回调函数
+class AuxLossScheduler(TrainerCallback):
+    """
+    在指定的 Epoch 后，降低或关闭 Aux Loss 的权重，让模型专注于生成指标 (CIDEr)。
+    """
+
+    def __init__(self, switch_epoch: int, new_lambda: float = 0.01):
+        self.switch_epoch = switch_epoch
+        self.new_lambda = new_lambda
+        self.has_switched = False
+
+    def on_epoch_begin(self, args, state, control, model=None, **kwargs):
+        current_epoch = int(state.epoch)
+
+        # 检查是否达到切换 Epoch
+        if current_epoch >= self.switch_epoch:
+            # 处理多卡训练 (DataParallel / DistributedDataParallel)
+            actual_model = model.module if hasattr(model, 'module') else model
+
+            # 修改模型属性 (如果存在)
+            if hasattr(actual_model, 'lambda_aux'):
+                if actual_model.lambda_aux != self.new_lambda:
+                    print(f"\n[AuxLossScheduler] Epoch {current_epoch}: "
+                          f"Changing lambda_aux from {actual_model.lambda_aux} to {self.new_lambda} "
+                          "to focus on CIDEr optimization.")
+                    actual_model.lambda_aux = self.new_lambda
+
+            # 同步修改 config 中的值 (为了严谨)
+            if hasattr(actual_model, 'config') and hasattr(actual_model.config, 'lambda_aux'):
+                actual_model.config.lambda_aux = self.new_lambda
 
 
 def get_model_and_auxiliaries(args):
@@ -68,10 +102,25 @@ def get_model_and_auxiliaries(args):
 
     use_ar_adapter = not getattr(args, "disable_ar_adapter", False)
     use_dual_path_refiner = getattr(args, "use_dual_path_refiner", False)
+    use_cbsa = getattr(args, "use_cbsa", False)
+
+    # 如果启用CBSA，自动禁用AR模块（避免重复增强）
+    if use_cbsa:
+        use_ar_adapter = False
+        print("CBSA enabled: AR adapter will be disabled to avoid redundant enhancement.")
+
+    # [修改] 计算 VG-TAR 的 FFN 维度，强制设为 1x Hidden Size 以减少参数
+    # 默认 Transformer FFN 是 4x，这里改为 1x (例如 768 -> 768)
+    text_hidden_size = clip_text_encoder.config.hidden_size
+    tar_ffn_dim = int(text_hidden_size * 4)
+    print(f"Setting VG-TAR FFN dim to {tar_ffn_dim} (1x hidden size) for parameter efficiency.")
+
     # pass text encoder & tokenizer into SmallCap factory
     model = SmallCap.from_encoder_decoder_pretrained(
         encoder_path,
         decoder_path,
+        use_dpg=args.use_dpg,
+        use_visual_selector=args.use_visual_selector,
         # === AR 图像增强参数 ===
         use_ar_adapter=use_ar_adapter,
         ar_down_ratio=args.ar_down_ratio,
@@ -83,8 +132,11 @@ def get_model_and_auxiliaries(args):
         dual_path_init_alpha=args.dual_path_init_alpha,
         apr_n_queries=args.apr_n_queries,
         apr_n_heads=args.apr_n_heads,
-        apr_proj_back=args.apr_proj_back,
+        apr_proj_back=args.apr_proj_back,  # 保持 True (默认)
         apr_dropout=args.apr_dropout,
+        # ===
+        # === CBSA视觉增强模块参数 ===
+        use_cbsa=args.use_cbsa,
         # ===
         # === TAR模块参数 ===
         use_tar_module=not args.disable_tar_module,
@@ -92,6 +144,7 @@ def get_model_and_auxiliaries(args):
         tar_dropout=args.tar_dropout,
         tar_use_gate=not args.disable_tar_gate,
         tar_init_gate=args.tar_init_gate,
+        tar_ffn_dim=tar_ffn_dim,  # [新增] 传入压缩后的 FFN 维度
         # ===
         cross_attention_reduce_factor=cross_attention_reduce_factor,
         text_encoder=clip_text_encoder,
@@ -126,7 +179,13 @@ def get_model_and_auxiliaries(args):
     model.config.tar_dropout = args.tar_dropout
     model.config.tar_use_gate = not args.disable_tar_gate
     model.config.tar_init_gate = args.tar_init_gate
+    model.config.tar_ffn_dim = tar_ffn_dim  # [新增] 保存到 config
     # === TAR模块配置结束 ===
+
+    # === 辅助对比损失配置 ===
+    model.config.use_aux_loss = not getattr(args, "disable_aux_loss", False)
+    model.config.lambda_aux = float(getattr(args, "lambda_aux", 0.1))
+    # === 辅助对比损失配置结束 ===
 
     # print("model",model)
     # print(stop)
@@ -156,7 +215,7 @@ def get_model_and_auxiliaries(args):
         if p.requires_grad and 'image_ar_adapter' in n
     )
     print(f'AR adapter trainable params: {ar_params}')
-    
+
     # 统计双路径增强模块的可训练参数
     dual_path_params = sum(
         p.numel()
@@ -165,7 +224,7 @@ def get_model_and_auxiliaries(args):
     )
     if dual_path_params > 0:
         print(f'DualPathRefiner trainable params: {dual_path_params}')
-    
+
     # 统计 FiLM 融合模块的可训练参数
     film_fusion_params = sum(
         p.numel()
@@ -174,7 +233,7 @@ def get_model_and_auxiliaries(args):
     )
     if film_fusion_params > 0:
         print(f'FiLM fusion trainable params: {film_fusion_params}')
-    
+
     # 统计 TAR 模块的可训练参数
     tar_params = sum(
         p.numel()
@@ -183,6 +242,16 @@ def get_model_and_auxiliaries(args):
     )
     if tar_params > 0:
         print(f'TAR module trainable params: {tar_params}')
+
+    # 统计辅助对比损失模块的可训练参数
+    aux_loss_params = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'aux_projector' in n
+    )
+    if aux_loss_params > 0:
+        print(f'Auxiliary Contrastive Loss trainable params: {aux_loss_params}')
+        print(f'Auxiliary Contrastive Loss weight (lambda_aux): {model.config.lambda_aux}')
 
     return model, tokenizer, feature_extractor, clip_text_tokenizer, clip_text_encoder
 
@@ -232,25 +301,48 @@ def main(args):
         use_ar_adapter = not args.disable_ar_adapter
         use_dual_path_refiner = args.use_dual_path_refiner
         use_tar_module = not args.disable_tar_module
-        
+        use_cbsa = getattr(args, "use_cbsa", False)
+
+        # 如果启用CBSA，自动禁用AR模块（避免重复增强）
+        if use_cbsa:
+            use_ar_adapter = False
+
         # 根据使用的增强模块添加路径标识
         if use_dual_path_refiner:
             output_dir = output_dir + "_dualpath"
+        elif use_cbsa:
+            output_dir = output_dir + "_cbsa"
         elif use_ar_adapter:
             output_dir = output_dir + "_ar"
-        
-        # 添加TAR模块标识
-        if use_tar_module:
-            output_dir = output_dir + "_tar"
-        
-        # 添加FiLM标识（因为现在默认使用FiLM替换了adapted_ffm）
-        output_dir = output_dir + "_film"
+
+        if args.exp_suffix:
+            suffix_clean = args.exp_suffix.strip()
+            if suffix_clean:
+                output_dir = f"{output_dir}_{suffix_clean}"
 
     def collate_fn(batch):
         # batch: list of samples (dict)
         # extract retrieved_captions (may be list[str] per sample)
         retrieved = [example.get("retrieved_captions", None) for example in batch]
+
+        # 提取原始文本（用于计算 GT text embeds）
+        gt_texts = [example.get("text", None) for example in batch]
+
         collated = default_data_collator(batch)
+
+        # 计算 GT text embeds（用于辅助对比损失）
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if gt_texts is not None and all(t is not None for t in gt_texts):
+            # 使用 CLIP text encoder 编码 GT 文本
+            with torch.no_grad():
+                gt_toks = clip_text_tokenizer(gt_texts, padding=True, truncation=True, return_tensors="pt")
+                gt_toks = {k: v.to(device) for k, v in gt_toks.items()}
+                gt_text_outputs = clip_text_encoder(**gt_toks)
+                # 使用 CLS token 的 hidden state 作为全局特征 [Batch, Clip_Dim]
+                gt_text_embeds = gt_text_outputs.last_hidden_state[:, 0, :].detach()  # [B, D_text]
+            collated["gt_text_embeds"] = gt_text_embeds
+        else:
+            collated["gt_text_embeds"] = None
 
         # If retrived is None or rag disabled, keep None
         if retrieved is None or all(x is None for x in retrieved):
@@ -318,6 +410,16 @@ def main(args):
         collated["retrieved_captions_mask"] = retrieved_mask
         return collated
 
+    # 计算总训练步数和 warmup 步数
+    if args.warmup_steps is None:
+        steps_per_epoch = len(train_dataset) // (args.batch_size * args.gradient_steps)
+        total_steps_estimate = steps_per_epoch * args.n_epochs
+        warmup_steps = min(1000, int(total_steps_estimate * 0.1))
+        print(f"自动设置 warmup_steps = {warmup_steps} (估算总步数: {total_steps_estimate})")
+    else:
+        warmup_steps = args.warmup_steps
+        print(f"使用指定的 warmup_steps = {warmup_steps}")
+
     training_args = Seq2SeqTrainingArguments(
         num_train_epochs=args.n_epochs,
         per_device_train_batch_size=args.batch_size,
@@ -329,7 +431,64 @@ def main(args):
         logging_strategy="epoch",
         output_dir=output_dir,
         overwrite_output_dir=True,
+        # 添加梯度裁剪
+        max_grad_norm=getattr(args, "max_grad_norm", 1.0),
+        # 添加 Warmup 和 Cosine Annealing 调度器
+        warmup_steps=warmup_steps,
+        lr_scheduler_type="cosine",
     )
+
+    # 创建自定义优化器，为门控参数设置独立的学习率
+    def create_optimizer_with_gate_lr(model, training_args, gate_lr_ratio):
+        """创建优化器，为 VG-TAR 模块的门控参数设置更低的学习率"""
+        gate_params = []
+        other_params = []
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if 'tar_module' in name and 'gate' in name:
+                    gate_params.append(param)
+                else:
+                    other_params.append(param)
+
+        base_lr = training_args.learning_rate
+        gate_lr = base_lr * gate_lr_ratio
+
+        param_groups = [
+            {"params": other_params, "lr": base_lr},
+        ]
+
+        if len(gate_params) > 0:
+            param_groups.append({
+                "params": gate_params,
+                "lr": gate_lr,
+            })
+            print(f"✓ 为 {len(gate_params)} 个门控参数设置独立学习率: {gate_lr:.6f}")
+
+        from torch.optim import AdamW
+        optimizer = AdamW(
+            param_groups,
+            lr=base_lr,
+            betas=(training_args.adam_beta1 if hasattr(training_args, 'adam_beta1') else 0.9,
+                   training_args.adam_beta2 if hasattr(training_args, 'adam_beta2') else 0.999),
+            eps=training_args.adam_epsilon if hasattr(training_args, 'adam_epsilon') else 1e-8,
+            weight_decay=training_args.weight_decay if hasattr(training_args, 'weight_decay') else 0.0,
+        )
+        return optimizer
+
+    print("\n=== 优化器配置 ===")
+    optimizer = create_optimizer_with_gate_lr(model, training_args, args.gate_lr_ratio)
+
+    # [新增] 初始化 AuxLossScheduler 回调
+    callbacks = []
+    if not args.disable_aux_loss:
+        # 默认策略：在最后 20% 的 Epoch 降低 Aux Loss，或者使用用户指定的 Epoch
+        decay_epoch = args.aux_loss_decay_epoch
+        if decay_epoch is None:
+            decay_epoch = max(1, args.n_epochs - 2)  # 默认最后 2 个 Epoch
+
+        print(f"\n[Strategy] Aux Loss 将在第 {decay_epoch} 个 Epoch 降低权重，专注于 CIDEr 优化。")
+        callbacks.append(AuxLossScheduler(switch_epoch=decay_epoch, new_lambda=0.01))
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -337,12 +496,14 @@ def main(args):
         data_collator=collate_fn,
         train_dataset=train_dataset,
         tokenizer=feature_extractor,
+        optimizers=(optimizer, None),
+        callbacks=callbacks,  # [新增] 添加回调
     )
 
     trainer.train()
 
 
-if __name__ == '__main__':
+def get_args_parser():
     parser = argparse.ArgumentParser(description='Model Training')
     parser.add_argument("--features_dir", type=str, default="features/",
                         help="Directory where cached input image features are stored")
@@ -372,17 +533,25 @@ if __name__ == '__main__':
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--gradient_steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Maximum gradient norm for clipping (default: 1.0, set to 0 to disable)")
+    parser.add_argument("--exp_suffix", type=str, default="",
+                        help="Optional suffix appended to the auto-generated experiment directory")
 
     parser.add_argument("--ablation_visual", action="store_true", default=False,
                         help="Whether to blank visual features")
-    parser.add_argument("--disable_ar_adapter", action="store_true", default=False,
+    parser.add_argument("--disable_ar_adapter", action="store_true", default=True,
                         help="Disable AR adapter enhancement on visual tokens")
-    parser.add_argument("--ar_down_ratio", type=int, default=4,
+    parser.add_argument("--ar_down_ratio", type=int, default=2,
                         help="Bottleneck ratio for AR adapter hidden size")
     parser.add_argument("--ar_dropout", type=float, default=0.1,
                         help="Dropout rate inside AR adapter")
     parser.add_argument("--disable_ar_gate", action="store_true", default=False,
                         help="Disable learnable gate inside AR adapter")
+    parser.add_argument("--use_cbsa", action="store_true", default=False,
+                        help="Enable CBSA (Contract-and-Broadcast Self-Attention) visual refiner")
+    parser.add_argument("--use_mamba", action="store_true", default=False,
+                        help="Enable Mamba Adapter for visual refinement.")
 
     # === 双路径增强模块 (DualPathRefiner) 参数 ===
     parser.add_argument("--use_dual_path_refiner", action="store_true", default=False,
@@ -393,7 +562,7 @@ if __name__ == '__main__':
                         help="Number of queries for AttentionPoolingRefiner")
     parser.add_argument("--apr_n_heads", type=int, default=8,
                         help="Number of attention heads for AttentionPoolingRefiner")
-    parser.add_argument("--apr_proj_back", action="store_true", default=True,
+    parser.add_argument("--apr_proj_back", action="store_true", default=False,
                         help="Whether to project back to token space in AttentionPoolingRefiner")
     parser.add_argument("--apr_dropout", type=float, default=0.1,
                         help="Dropout rate inside AttentionPoolingRefiner")
@@ -423,16 +592,50 @@ if __name__ == '__main__':
                         help="Dropout rate inside TAR module (default: 0.1)")
     parser.add_argument("--disable_tar_gate", action="store_true", default=False,
                         help="Disable learnable gate inside TAR module")
-    parser.add_argument("--tar_init_gate", type=float, default=-2.0,
-                        help="Initial value for gate parameter in TAR module (default: -2.0)")
+    parser.add_argument("--tar_init_gate", type=float, default=-4.0,
+                        help="Initial value for gate parameter in TAR module (default: -4.0, ensures Sigmoid(gate) near 0 at initialization)")
     # === TAR模块参数结束 ===
+
+    # === 训练策略参数 ===
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="Number of warmup steps for learning rate scheduler (default: 1000 or 10%% of total steps, whichever is smaller)")
+    parser.add_argument("--gate_lr_ratio", type=float, default=0.5,
+                        help="Learning rate ratio for gate parameters relative to baseline LR (default: 0.5, i.e., gate LR = 0.5 * base LR)")
+    # === 训练策略参数结束 ===
+
+    # === 辅助对比损失参数 ===
+    parser.add_argument("--disable_aux_loss", action="store_true", default=False,
+                        help="Disable auxiliary contrastive loss (default: enabled)")
+    parser.add_argument("--lambda_aux", type=float, default=0.1,
+                        help="Weight for auxiliary contrastive loss (default: 0.1)")
+    # [新增] 参数控制 Aux Loss 衰减时机
+    parser.add_argument("--aux_loss_decay_epoch", type=int, default=None,
+                        help="Epoch to reduce/disable auxiliary loss (default: last 2 epochs)")
+    # === 辅助对比损失参数结束 ===
 
     # === 输出路径配置 ===
     parser.add_argument("--output_dir_name", type=str, default=None,
                         help="Custom output directory name (if not specified, will auto-generate based on model config)")
     # === 输出路径配置结束 ===
 
+    parser.add_argument("--use_dpg", action="store_true", default=False,
+                        help="Use Detail-Oriented Prompt Generation (DPG) instead of VG-TAR.")
+    # MoE 参数
+    parser.add_argument("--use_moe", action="store_true", default=False,
+                        help="Enable Mixture-of-Experts (MoE) Adapter.")
+    parser.add_argument("--moe_num_experts", type=int, default=4,
+                        help="Number of experts in MoE.")
+    parser.add_argument("--moe_topk", type=int, default=2,
+                        help="Top-K experts active per token.")
 
+    parser.add_argument("--use_visual_selector", action="store_true", default=False,
+                        help="Enable Text-Guided Visual Selector for visual denoising.")
+
+    return parser
+
+if __name__ == '__main__':
+    # 调用上面的函数获取 parser
+    parser = get_args_parser()
     args = parser.parse_args()
 
     main(args)

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 class CBSAVisionProjector(nn.Module):
     """
-    将 CBSA / CLIP image encoder 输出投影到 fusion_dim。
+    将CLIP image encoder 输出投影到 fusion_dim。
 
     输入:
         x: Tensor [B, N, C_in]  (N = patch num)

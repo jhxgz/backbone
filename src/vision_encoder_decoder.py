@@ -41,8 +41,12 @@ from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
 from .modules.Film import FiLMTokenizerFusion
 from .modules.dual_path_refiner import DualPathRefiner
-from .modules.TAR import TextAdapterResidual
-
+from .modules.TAR import VisualGuidedTAR
+from .modules.DPG import DetailOrientedPromptGenerator
+from .modules.CBSA import CBSA
+from .modules.MambaAdapter import MambaAdapter
+from .modules.MoEAdapter import MoEAdapter
+from .modules.VisualSelector import TextGuidedVisualSelector
 
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
@@ -246,19 +250,45 @@ class SmallCap(PreTrainedModel):
 
         self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
 
-        # ===> BEGIN: 添加TAR模块用于增强text encoder输出的文本特征 <===
+        # ===> BEGIN: 添加VG-TAR模块用于增强text encoder输出的文本特征 <===
         self.use_tar_module = getattr(self.config, "use_tar_module", True)
         if self.use_tar_module and self.text_encoder is not None:
-            self.tar_module = TextAdapterResidual(
+            # === [修改] 使用 DPG 替换 VG-TAR ===
+            # 不需要复杂的 FFN 参数，只需要一个简单的线性层
+            print("Initializing Lightweight DPG Module (DoPL based)...")
+            self.tar_module = DetailOrientedPromptGenerator(
                 dim=text_hidden,
-                down_ratio=int(getattr(self.config, "tar_down_ratio", 8)),
-                dropout=float(getattr(self.config, "tar_dropout", 0.1)),
-                use_gate=bool(getattr(self.config, "tar_use_gate", True)),
-                init_gate=float(getattr(self.config, "tar_init_gate", -2.0)),
+                dropout=float(getattr(self.config, "tar_dropout", 0.1))
             )
+
+            # 维度对齐（如果视觉和文本维度不同）
+            if fusion_dim != text_hidden:
+                self.tar_visual_proj = nn.Linear(fusion_dim, text_hidden)
+            else:
+                self.tar_visual_proj = None
         else:
             self.tar_module = None
-        # ===> END: TAR模块 <===
+            self.tar_visual_proj = None
+        # ===> END: VG-TAR模块 <===
+
+        # === [新增] Visual Selector (用于视觉去噪) ===
+        self.use_visual_selector = getattr(self.config, "use_visual_selector", False)
+        if self.use_visual_selector:
+            print("Initializing TextGuidedVisualSelector (Visual Denoising)...")
+            self.visual_selector = TextGuidedVisualSelector(
+                dim=fusion_dim,
+                dropout=float(getattr(self.config, "ar_dropout", 0.1))
+            )
+        else:
+            self.visual_selector = None
+
+        # ===> BEGIN: 添加上下文混合器 (Contextual Mixer) <===
+        # 用于平衡VG-TAR过滤后的特征和原始全局语义
+        if self.use_tar_module and self.text_encoder is not None:
+            self.mixer_alpha = nn.Parameter(torch.ones(1) * 0.5)
+        else:
+            self.mixer_alpha = None
+        # ===> END: 上下文混合器 <===
 
         # ===> BEGIN: 添加双路径增强模块 (DualPathRefiner) <===
         # 在 CLIP image encoder 输出后使用双路径增强模块
@@ -292,6 +322,57 @@ class SmallCap(PreTrainedModel):
             )
         # ===> END: AR 图像增强模块 <===
 
+        # ===> BEGIN: 添加CBSA视觉增强模块 <===
+        self.use_cbsa = getattr(self.config, "use_cbsa", False)
+        if self.use_cbsa:
+            print("Initializing CBSA Visual Refiner...")
+            self.cbsa_refiner = CBSA(
+                dim=fusion_dim,
+                heads=8,
+                dropout=float(getattr(self.config, "ar_dropout", 0.1))
+            )
+        else:
+            self.cbsa_refiner = None
+        # ===> END: CBSA视觉增强模块 <===
+
+        # === [新增] Mamba Adapter (SOTA 视觉增强) ===
+        self.use_mamba = getattr(self.config, "use_mamba", False)
+        if self.use_mamba:
+            print("Initializing Mamba Visual Adapter (Fast & Strong)...")
+            self.visual_refiner = MambaAdapter(
+                dim=fusion_dim,
+                d_state=16,
+                expand=2,  # 2x 扩展能提供足够的容量
+                dropout=float(getattr(self.config, "ar_dropout", 0.1)),
+                num_layers=1  # 1层足够，保持轻量
+            )
+        else:
+            # 兼容旧代码逻辑
+            self.visual_refiner = None
+            if getattr(self, "use_cbsa", False):
+                self.visual_refiner = self.cbsa_refiner
+            elif getattr(self, "use_ar_adapter", False):
+                self.visual_refiner = self.image_ar_adapter
+        # === [新增] MoE Adapter (大规模模型的视觉增强) ===
+        self.use_moe = getattr(self.config, "use_moe", False)
+
+        if self.use_moe:
+            print("Initializing MoE Visual Adapter (4 Experts, Top-2)...")
+            self.visual_refiner = MoEAdapter(
+                dim=fusion_dim,
+                num_experts=int(getattr(self.config, "moe_num_experts", 4)),
+                top_k=int(getattr(self.config, "moe_topk", 2)),
+                down_ratio=int(getattr(self.config, "ar_down_ratio", 4)),  # 复用AR的缩放比
+                dropout=float(getattr(self.config, "ar_dropout", 0.1))
+            )
+        else:
+            # 兼容旧代码 (AR / CBSA)
+            self.visual_refiner = None
+            if getattr(self, "use_cbsa", False):
+                self.visual_refiner = self.cbsa_refiner
+            elif getattr(self, "use_ar_adapter", False):
+                self.visual_refiner = self.image_ar_adapter
+
         # 融合模块 - 使用FiLM替换adapted_ffm
         film_hidden = getattr(self.config, "film_hidden", None)
         if film_hidden is None:
@@ -306,6 +387,23 @@ class SmallCap(PreTrainedModel):
             text_pool=getattr(self.config, "film_text_pool", "mean"),
             dropout=float(getattr(self.config, "film_dropout", 0.0))
         )
+
+        # ===> BEGIN: 辅助对比损失 (Auxiliary Contrastive Loss) <===
+        # 用于监督融合层的中间特征，强制融合后的特征与 GT 文本的语义保持一致
+        self.use_aux_loss = getattr(self.config, "use_aux_loss", True)
+        if self.use_aux_loss:
+            # 获取 CLIP text encoder 的隐藏维度（用于 GT text embeds 的维度）
+            clip_embed_dim = text_hidden  # CLIP text encoder 的 hidden_size
+
+            # 投影头：将融合特征映射到与 CLIP 文本嵌入相同的维度
+            self.aux_projector = nn.Linear(fusion_dim, clip_embed_dim)
+
+            # 损失函数权重（可以通过 config 配置，默认 0.1）
+            self.lambda_aux = float(getattr(self.config, "lambda_aux", 0.1))
+
+            # 余弦嵌入损失函数
+            self.aux_loss_fn = nn.CosineEmbeddingLoss()
+        # ===> END: 辅助对比损失 <===
 
         self.encoder.config = self.config.encoder
         self.decoder.config = self.config.decoder
@@ -530,6 +628,7 @@ class SmallCap(PreTrainedModel):
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
+            gt_text_embeds=None,
             **kwargs,
     ):
         r"""
@@ -572,12 +671,16 @@ class SmallCap(PreTrainedModel):
         retrieved_caps = kwargs.pop("retrieved_captions", None)
         retrieved_caps_mask = kwargs.pop("retrieved_captions_mask", None)
 
+        # 从kwargs中提取gt_text_embeds（如果通过kwargs传递）
+        if gt_text_embeds is None:
+            gt_text_embeds = kwargs.pop("gt_text_embeds", None)
+
         kwargs_encoder = {
-            argument: value 
-            for argument, value in kwargs.items() 
+            argument: value
+            for argument, value in kwargs.items()
             if not argument.startswith("decoder_")
-            # 排除retrieved_captions相关参数，它们不应该传递给encoder
-            and argument not in ["retrieved_captions", "retrieved_captions_mask"]
+               # 排除retrieved_captions相关参数，它们不应该传递给encoder
+               and argument not in ["retrieved_captions", "retrieved_captions_mask"]
         }
 
         kwargs_decoder = {
@@ -611,12 +714,18 @@ class SmallCap(PreTrainedModel):
         # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
         img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
 
+        # Step 1.5: Visual Refinement (Mamba / CBSA / AR)
+        if self.visual_refiner is not None:
+            img_feats = self.visual_refiner(img_feats)
+
         # ===== Step 2: 使用双路径增强模块增强图像特征 =====
         if getattr(self, "use_dual_path_refiner", False):
             img_feats = self.dual_path_refiner(img_feats)  # [B, N, fusion_dim]
 
-        # ===== Step 3: 使用AR模块增强图像特征（如果双路径模块未启用，则使用此路径） =====
-        if getattr(self, "use_ar_adapter", False) and not getattr(self, "use_dual_path_refiner", False):
+        # ===== Step 3: 使用AR模块增强图像特征（如果CBSA和双路径模块都未启用，则使用此路径） =====
+        if (getattr(self, "use_ar_adapter", False)
+            and not getattr(self, "use_dual_path_refiner", False)
+            and not getattr(self, "use_cbsa", False)):
             img_feats = img_feats + self.image_ar_adapter(img_feats)
 
         # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）
@@ -625,8 +734,9 @@ class SmallCap(PreTrainedModel):
         if retrieved_caps is not None and self.text_tokenizer is not None and self.text_encoder is not None:
             # ===== Step 3: 使用CLIP text encoder生成caption embedding =====
             # encode_prompts 会接受 tensor 或字符串列表
-            # 返回 prompt_embeds: [B, L, D_text] 以及 attn_mask: [B, L]
-            prompt_embeds, attn_mask = self.encode_prompts(retrieved_caps)
+            # 返回 (prompt_embeds_refined, prompt_embeds_raw, attn_mask)
+            prompt_embeds_refined, prompt_embeds_raw, attn_mask = self.encode_prompts(retrieved_caps,
+                                                                                      visual_feats=img_feats)
 
             # 如果外部传入了 retrieved_caps_mask （来自 dataset/collate），优先使用它（按需）
             if retrieved_caps_mask is not None:
@@ -641,9 +751,39 @@ class SmallCap(PreTrainedModel):
                     # 两者都存在时，使用按位相与（若需）
                     attn_mask = (attn_mask.long() & retrieved_caps_mask.long()).long()
 
+            # ===== Step 3.5: 使用上下文混合器平衡VG-TAR过滤后的特征和原始全局语义 =====
+            if self.mixer_alpha is not None and prompt_embeds_refined is not None and prompt_embeds_raw is not None:
+                # f_refined_tokens: VG-TAR模块的输出 [B, N, C]
+                f_refined_tokens = prompt_embeds_refined
+                # f_raw_text_feats: 原始的、未经过VG-TAR处理的文本特征 [B, T, C]
+                f_raw_text_feats = prompt_embeds_raw
+
+                # 计算全局嵌入：对 f_raw_text_feats 进行平均池化，得到 f_global [B, C]
+                f_global = f_raw_text_feats.mean(dim=1)  # [B, C]
+
+                # 扩展全局嵌入到Token维度，使其形状变为 [B, N, C]
+                # 其中 N 是 f_refined_tokens 的序列长度
+                f_global_expanded = f_global.unsqueeze(1).expand_as(f_refined_tokens)  # [B, N, C]
+
+                # 门控混合
+                alpha = torch.sigmoid(self.mixer_alpha)
+                f_mixed_prompt = alpha * f_refined_tokens + (1 - alpha) * f_global_expanded
+
+                # 将混合后的特征替换原来的 f_refined_tokens
+                prompt_embeds = f_mixed_prompt
+            else:
+                # 如果没有上下文混合器，直接使用VG-TAR的输出（或原始特征）
+                prompt_embeds = prompt_embeds_refined if prompt_embeds_refined is not None else prompt_embeds_raw
+
             # ===== Step 4: 投影caption embedding到融合维度 =====
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
+
+            # === [新增] Step 4.5: 使用文本特征对视觉特征进行反向去噪 ===
+            if self.visual_selector is not None:
+                # 输入: 当前的图像特征 img_feats 和 投影后的文本特征 prompt_feats
+                # 输出: 去除背景噪音后的 img_feats
+                img_feats = self.visual_selector(img_feats, prompt_feats)
 
             # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合 =====
             # 调用 FiLM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
@@ -653,6 +793,35 @@ class SmallCap(PreTrainedModel):
 
         # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
         encoder_hidden_states = img_feats
+
+        # ===== Step 6: 计算辅助对比损失 (Auxiliary Contrastive Loss) =====
+        loss_aux = None
+        if self.use_aux_loss and gt_text_embeds is not None and labels is not None:
+            # 融合后的特征 img_feats 的形状: [Batch, Seq_Len, fusion_dim]
+            fusion_features = img_feats  # [B, N, fusion_dim]
+
+            # 1. 池化：对融合特征进行平均池化，去掉序列维度
+            pooled_feat = fusion_features.mean(dim=1)  # [B, fusion_dim]
+
+            # 2. 投影：将融合特征映射到 CLIP 文本嵌入维度
+            projected_feat = self.aux_projector(pooled_feat)  # [B, clip_embed_dim]
+
+            # 3. 确保 gt_text_embeds 的维度正确
+            if gt_text_embeds.dim() == 3:
+                # 如果是 [B, L, D]，进行池化
+                gt_text_embeds = gt_text_embeds.mean(dim=1)  # [B, clip_embed_dim]
+            elif gt_text_embeds.dim() == 2:
+                # 如果是 [B, D]，已经是正确的形状
+                pass
+            else:
+                # 如果是其他维度，报错或跳过
+                raise ValueError(f"Unsupported gt_text_embeds dimension: {gt_text_embeds.dim()}, expected 2 or 3")
+
+            # 4. 计算余弦嵌入损失（目标标签为1，表示应相似）
+            batch_size = projected_feat.size(0)
+            device = projected_feat.device
+            target = torch.ones(batch_size, device=device)
+            loss_aux = self.aux_loss_fn(projected_feat, gt_text_embeds, target)
 
         # Decode
         decoder_outputs = self.decoder(
@@ -671,10 +840,21 @@ class SmallCap(PreTrainedModel):
 
         # Compute loss independent from decoder (as some shift the logits inside them)
         loss = None
+        loss_caption = None
         if labels is not None:
             logits = decoder_outputs.logits if return_dict else decoder_outputs[0]
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), labels.view(-1))
+            loss_caption = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), labels.view(-1))
+
+            # 合并辅助损失到总损失
+            if loss_aux is not None:
+                loss = loss_caption + self.lambda_aux * loss_aux
+            else:
+                loss = loss_caption
+        else:
+            # 即使没有labels，如果有辅助损失，也可以计算（虽然通常不会发生）
+            if loss_aux is not None:
+                loss = self.lambda_aux * loss_aux
 
         if not return_dict:
             if loss is not None:
@@ -682,6 +862,9 @@ class SmallCap(PreTrainedModel):
             else:
                 return decoder_outputs + encoder_outputs
 
+        # 将辅助损失添加到返回字典中以便监控
+        # 注意：Seq2SeqLMOutput 没有 loss_aux 字段，所以我们返回 loss
+        # 如果需要监控 loss_aux，可以通过自定义返回或日志记录
         return Seq2SeqLMOutput(
             loss=loss,
             logits=decoder_outputs.logits,
@@ -710,11 +893,31 @@ class SmallCap(PreTrainedModel):
             "past_key_values": decoder_inputs["past_key_values"],
             "use_cache": use_cache,
         }
-        # 从kwargs中提取retrieved_captions相关参数，传递给forward
+
+        # === [新增] 辅助函数：根据 input_ids 的 Batch Size 扩展自定义参数 ===
+        def expand_to_match_beams(tensor, target_bsz):
+            if tensor is None:
+                return None
+            curr_bsz = tensor.shape[0]
+            # 如果当前 Batch Size 小于目标 Batch Size (说明开启了 Beam Search)
+            if target_bsz > curr_bsz:
+                num_beams = target_bsz // curr_bsz
+                # 使用 repeat_interleave 进行复制 (e.g., [A, B] -> [A, A, A, B, B, B])
+                return tensor.repeat_interleave(num_beams, dim=0)
+            return tensor
+
+        # 获取当前实际的 Batch Size (包含 Beam Search 扩展后的)
+        target_bsz = input_ids.shape[0]
+
+        # 从kwargs中提取retrieved_captions相关参数，并进行必要的扩展
         if "retrieved_captions" in kwargs:
-            input_dict["retrieved_captions"] = kwargs.pop("retrieved_captions")
+            val = kwargs.pop("retrieved_captions")
+            input_dict["retrieved_captions"] = expand_to_match_beams(val, target_bsz)
+
         if "retrieved_captions_mask" in kwargs:
-            input_dict["retrieved_captions_mask"] = kwargs.pop("retrieved_captions_mask")
+            val = kwargs.pop("retrieved_captions_mask")
+            input_dict["retrieved_captions_mask"] = expand_to_match_beams(val, target_bsz)
+
         # 其他kwargs参数也传递
         input_dict.update(kwargs)
         return input_dict
@@ -728,7 +931,7 @@ class SmallCap(PreTrainedModel):
         # 从model_kwargs中提取retrieved_captions相关参数（这些不应该传递给encoder）
         retrieved_captions = model_kwargs.pop("retrieved_captions", None)
         retrieved_captions_mask = model_kwargs.pop("retrieved_captions_mask", None)
-        
+
         # 调用父类方法（此时model_kwargs已经不包含retrieved_captions了）
         # 注意：如果父类没有这个方法，我们需要自己实现
         try:
@@ -740,29 +943,29 @@ class SmallCap(PreTrainedModel):
             # 这是从transformers库的generation_utils.py中简化版本
             if model_input_name is None:
                 model_input_name = self.main_input_name
-            
+
             encoder_kwargs = {}
             if model_input_name in model_kwargs:
                 encoder_kwargs[model_input_name] = model_kwargs.pop(model_input_name)
-            
+
             # 过滤掉不应传递给encoder的参数
             encoder_kwargs.update({
                 k: v for k, v in model_kwargs.items()
-                if k not in ["retrieved_captions", "retrieved_captions_mask", "decoder_input_ids", 
-                            "decoder_attention_mask", "past_key_values", "use_cache"]
-                and not k.startswith("decoder_")
+                if k not in ["retrieved_captions", "retrieved_captions_mask", "decoder_input_ids",
+                             "decoder_attention_mask", "past_key_values", "use_cache"]
+                   and not k.startswith("decoder_")
             })
-        
+
         # 将retrieved_captions参数添加回model_kwargs，以便传递给forward
         if retrieved_captions is not None:
             model_kwargs["retrieved_captions"] = retrieved_captions
         if retrieved_captions_mask is not None:
             model_kwargs["retrieved_captions_mask"] = retrieved_captions_mask
-        
+
         # 确保encoder_kwargs不包含这些参数
         encoder_kwargs.pop("retrieved_captions", None)
         encoder_kwargs.pop("retrieved_captions_mask", None)
-        
+
         return encoder_kwargs
 
     def resize_token_embeddings(self, *args, **kwargs):
@@ -775,12 +978,14 @@ class SmallCap(PreTrainedModel):
         # apply decoder cache reordering here
         return self.decoder._reorder_cache(past, beam_idx)
 
-    def encode_prompts(self, prompt_input):
+    def encode_prompts(self, prompt_input, visual_feats=None):
         """
             Accept:
               - None
               - list[str] (长度 batch_size) OR list[list[str]] (每个 sample 为多个 retrieved captions)
               - torch.Tensor of shape [B, K, D_text] (precomputed pooled embeddings) OR [B, D_text]
+            Args:
+              visual_feats: (B, T_vis, fusion_dim) - 视觉特征，用于VG-TAR跨模态交互
             Return:
               prompt_embeds: torch.Tensor [B, L, D_text]
               attn_mask: torch.Tensor [B, L] (1 for valid token, 0 for pad) or None if not applicable
@@ -794,26 +999,38 @@ class SmallCap(PreTrainedModel):
 
         # None case
         if prompt_input is None:
-            return None, None
+            return None, None, None
 
         # If already tensor: assume pooled or token-level embeddings provided
         if torch.is_tensor(prompt_input):
             x = prompt_input.to(device)
+            x_raw = x  # 保存原始特征
             # if 2D -> [B, D] treat as pooled single prompt per image
             if x.dim() == 2:
                 x = x.unsqueeze(1)  # [B, 1, D_text]
+                x_raw = x  # 更新原始特征
                 attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
-                return x, attn_mask
+                if self.tar_module is not None and visual_feats is not None:
+                    visual_feats = visual_feats.to(device)
+                    if self.tar_visual_proj is not None:
+                        visual_feats = self.tar_visual_proj(visual_feats)
+                    x = self.tar_module(x, visual_feats)
+                return x, x_raw, attn_mask
             # if 3D -> [B, K, D_text] already token-level/pool-level per caption
             if x.dim() == 3:
                 attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
-                return x, attn_mask
+                if self.tar_module is not None and visual_feats is not None:
+                    visual_feats = visual_feats.to(device)
+                    if self.tar_visual_proj is not None:
+                        visual_feats = self.tar_visual_proj(visual_feats)
+                    x = self.tar_module(x, visual_feats)
+                return x, x_raw, attn_mask
             raise ValueError("Unsupported tensor dim for prompt_input: got dim = %d" % x.dim())
 
         # Else expect list[str] or list[list[str]]
         prompt_texts = prompt_input
         if len(prompt_texts) == 0:
-            return None, None
+            return None, None, None
 
         # If inner lists (multiple captions per sample), join them into one sequence per sample by default
         # (alternative: you may want to keep them separate; adjust if needed)
@@ -826,13 +1043,17 @@ class SmallCap(PreTrainedModel):
 
         # forward through text encoder
         outputs = self.text_encoder(**enc)
-        prompt_embeds = outputs.last_hidden_state  # [B, L_text, D_text]
-        
-        # ===> BEGIN: 使用TAR模块增强text encoder输出的文本特征 <===
-        if self.tar_module is not None:
-            prompt_embeds = self.tar_module(prompt_embeds)  # [B, L_text, D_text]
-        # ===> END: TAR模块增强 <===
-        
-        attn_mask = enc.get("attention_mask", None)
-        return prompt_embeds, attn_mask
+        prompt_embeds_raw = outputs.last_hidden_state  # [B, L_text, D_text] - 原始特征
 
+        # ===> BEGIN: 使用VG-TAR模块增强text encoder输出的文本特征 <===
+        prompt_embeds_refined = prompt_embeds_raw  # 默认使用原始特征
+        if self.tar_module is not None and visual_feats is not None:
+            visual_feats = visual_feats.to(device)
+            if self.tar_visual_proj is not None:
+                visual_feats = self.tar_visual_proj(visual_feats)
+            prompt_embeds_refined = self.tar_module(prompt_embeds_raw, visual_feats)
+        # ===> END: VG-TAR模块增强 <===
+
+        attn_mask = enc.get("attention_mask", None)
+        # 返回 (refined_embeds, raw_embeds, attn_mask) 用于上下文混合器
+        return prompt_embeds_refined, prompt_embeds_raw, attn_mask
