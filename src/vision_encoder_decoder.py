@@ -40,9 +40,11 @@ from .opt import ThisOPTConfig
 from .modules.AR import AdapterResidual
 from .modules.multimodal_projection import CBSAVisionProjector, PromptProjector
 from .modules.Film import FiLMTokenizerFusion
+from .modules.LiteAdaLNZero import LiteAdaLNZero
+from .modules.GatedFusion import GatedFusion
 from .modules.dual_path_refiner import DualPathRefiner
 from .modules.TAR import VisualGuidedTAR
-from .modules.DPG import DetailOrientedPromptGenerator
+from .modules.DPG import ChannelWiseDPG
 from .modules.CBSA import CBSA
 from .modules.MambaAdapter import MambaAdapter
 from .modules.MoEAdapter import MoEAdapter
@@ -226,7 +228,7 @@ class SmallCap(PreTrainedModel):
         self.text_encoder = text_encoder
         self.text_tokenizer = text_tokenizer
 
-        # 创建visual_proj / prompt_proj / film_fusion
+        # 创建visual_proj / prompt_proj / gate_fusion
         enc_hidden = (
             self.encoder.config.hidden_size
             if hasattr(self.encoder.config, "hidden_size")
@@ -234,8 +236,12 @@ class SmallCap(PreTrainedModel):
         )
         fusion_dim = getattr(self.config, "fusion_dim", enc_hidden)
 
+        # 定义要提取的多层特征索引（倒数第1、6、12层）
+        self.feature_layers = [-1, -6, -12]
+
         # 图像投影：CLIP vision encoder输出 -> fusion_dim
-        self.visual_proj = CBSAVisionProjector(in_dim=enc_hidden, out_dim=fusion_dim)
+        # 输入维度为 enc_hidden * len(self.feature_layers)，以接收拼接后的多层特征
+        self.visual_proj = CBSAVisionProjector(in_dim=enc_hidden * len(self.feature_layers), out_dim=fusion_dim)
 
         # prompt投影：需要根据text_encoder的hidden_size决定in_dim
         text_hidden = None
@@ -256,7 +262,7 @@ class SmallCap(PreTrainedModel):
             # === [修改] 使用 DPG 替换 VG-TAR ===
             # 不需要复杂的 FFN 参数，只需要一个简单的线性层
             print("Initializing Lightweight DPG Module (DoPL based)...")
-            self.tar_module = DetailOrientedPromptGenerator(
+            self.tar_module = ChannelWiseDPG(
                 dim=text_hidden,
                 dropout=float(getattr(self.config, "tar_dropout", 0.1))
             )
@@ -266,21 +272,13 @@ class SmallCap(PreTrainedModel):
                 self.tar_visual_proj = nn.Linear(fusion_dim, text_hidden)
             else:
                 self.tar_visual_proj = None
+            # === 新增: 专门给 DPG 输入的视觉特征做归一化 ===
+            self.tar_visual_ln = nn.LayerNorm(text_hidden)
         else:
             self.tar_module = None
             self.tar_visual_proj = None
         # ===> END: VG-TAR模块 <===
 
-        # === [新增] Visual Selector (用于视觉去噪) ===
-        self.use_visual_selector = getattr(self.config, "use_visual_selector", False)
-        if self.use_visual_selector:
-            print("Initializing TextGuidedVisualSelector (Visual Denoising)...")
-            self.visual_selector = TextGuidedVisualSelector(
-                dim=fusion_dim,
-                dropout=float(getattr(self.config, "ar_dropout", 0.1))
-            )
-        else:
-            self.visual_selector = None
 
         # ===> BEGIN: 添加上下文混合器 (Contextual Mixer) <===
         # 用于平衡VG-TAR过滤后的特征和原始全局语义
@@ -311,81 +309,23 @@ class SmallCap(PreTrainedModel):
             )
         # ===> END: 双路径增强模块 <===
 
-        # ===> BEGIN: 添加AR模块用于图像特征增强（保留原有功能，可选） <===
-        self.use_ar_adapter = getattr(self.config, "use_ar_adapter", True)
-        if self.use_ar_adapter:
-            self.image_ar_adapter = AdapterResidual(
+        # ===> BEGIN: 使用VS模块（VisualSelector）进行视觉特征增强 <===
+        self.use_visual_selector = getattr(self.config, "use_visual_selector", True)
+        if self.use_visual_selector:
+            print("Initializing TextGuidedVisualSelector (VS) for visual enhancement...")
+            self.visual_selector = TextGuidedVisualSelector(
                 dim=fusion_dim,
-                down_ratio=int(getattr(self.config, "ar_down_ratio", 4)),
-                dropout=float(getattr(self.config, "ar_dropout", 0.1)),
-                use_gate=bool(getattr(self.config, "ar_use_gate", True)),
-            )
-        # ===> END: AR 图像增强模块 <===
-
-        # ===> BEGIN: 添加CBSA视觉增强模块 <===
-        self.use_cbsa = getattr(self.config, "use_cbsa", False)
-        if self.use_cbsa:
-            print("Initializing CBSA Visual Refiner...")
-            self.cbsa_refiner = CBSA(
-                dim=fusion_dim,
-                heads=8,
-                dropout=float(getattr(self.config, "ar_dropout", 0.1))
+                dropout=float(getattr(self.config, "vs_dropout", 0.1))
             )
         else:
-            self.cbsa_refiner = None
-        # ===> END: CBSA视觉增强模块 <===
+            self.visual_selector = None
+        # ===> END: VS视觉增强模块 <===
 
-        # === [新增] Mamba Adapter (SOTA 视觉增强) ===
-        self.use_mamba = getattr(self.config, "use_mamba", False)
-        if self.use_mamba:
-            print("Initializing Mamba Visual Adapter (Fast & Strong)...")
-            self.visual_refiner = MambaAdapter(
-                dim=fusion_dim,
-                d_state=16,
-                expand=2,  # 2x 扩展能提供足够的容量
-                dropout=float(getattr(self.config, "ar_dropout", 0.1)),
-                num_layers=1  # 1层足够，保持轻量
-            )
-        else:
-            # 兼容旧代码逻辑
-            self.visual_refiner = None
-            if getattr(self, "use_cbsa", False):
-                self.visual_refiner = self.cbsa_refiner
-            elif getattr(self, "use_ar_adapter", False):
-                self.visual_refiner = self.image_ar_adapter
-        # === [新增] MoE Adapter (大规模模型的视觉增强) ===
-        self.use_moe = getattr(self.config, "use_moe", False)
-
-        if self.use_moe:
-            print("Initializing MoE Visual Adapter (4 Experts, Top-2)...")
-            self.visual_refiner = MoEAdapter(
-                dim=fusion_dim,
-                num_experts=int(getattr(self.config, "moe_num_experts", 4)),
-                top_k=int(getattr(self.config, "moe_topk", 2)),
-                down_ratio=int(getattr(self.config, "ar_down_ratio", 4)),  # 复用AR的缩放比
-                dropout=float(getattr(self.config, "ar_dropout", 0.1))
-            )
-        else:
-            # 兼容旧代码 (AR / CBSA)
-            self.visual_refiner = None
-            if getattr(self, "use_cbsa", False):
-                self.visual_refiner = self.cbsa_refiner
-            elif getattr(self, "use_ar_adapter", False):
-                self.visual_refiner = self.image_ar_adapter
-
-        # 融合模块 - 使用FiLM替换adapted_ffm
-        film_hidden = getattr(self.config, "film_hidden", None)
-        if film_hidden is None:
-            film_hidden = max(256, fusion_dim)
-        self.film_fusion = FiLMTokenizerFusion(
+        # === 融合模块初始化：使用 GatedFusion 模块 ===
+        print("Initializing GatedFusion module...")
+        self.gate_fusion = GatedFusion(
             dim=fusion_dim,
-            text_dim=fusion_dim,
-            hidden=film_hidden,
-            per_token=getattr(self.config, "film_per_token", False),
-            use_residual=getattr(self.config, "film_use_residual", True),
-            init_alpha=float(getattr(self.config, "film_init_alpha", 0.1)),
-            text_pool=getattr(self.config, "film_text_pool", "mean"),
-            dropout=float(getattr(self.config, "film_dropout", 0.0))
+            dropout=float(getattr(self.config, "gate_fusion_dropout", 0.1))
         )
 
         # ===> BEGIN: 辅助对比损失 (Auxiliary Contrastive Loss) <===
@@ -690,10 +630,11 @@ class SmallCap(PreTrainedModel):
             if pixel_values is None:
                 raise ValueError("You have to specify pixel_values")
 
+            # 强制开启 output_hidden_states 以获取所有层的特征
             encoder_outputs = self.encoder(
                 pixel_values=pixel_values,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=True,  # 强制开启以获取多层特征
                 return_dict=return_dict,
                 **kwargs_encoder,
             )
@@ -702,7 +643,31 @@ class SmallCap(PreTrainedModel):
         else:
             encoder_outputs = BaseModelOutput(encoder_outputs, None)
 
-        encoder_hidden_states = encoder_outputs[0]
+        # 多层视觉特征融合：从 hidden_states 中提取指定层的特征并拼接
+        if hasattr(encoder_outputs, 'hidden_states') and encoder_outputs.hidden_states is not None:
+            # 提取指定层的特征
+            selected_features = []
+            for layer_idx in self.feature_layers:
+                # 使用负数索引从后往前访问（-1是最后一层，-6是倒数第6层，-12是倒数第12层）
+                selected_features.append(encoder_outputs.hidden_states[layer_idx])
+            
+            # 在通道维度（dim=-1）拼接多层特征
+            encoder_hidden_states = torch.cat(selected_features, dim=-1)  # [B, N, enc_hidden * len(feature_layers)]
+        else:
+            # 兼容性保底：如果没有 hidden_states，使用最后一层输出
+            # 注意：这种情况下维度可能不匹配，因为 visual_proj 期望的输入维度是 enc_hidden * len(feature_layers)
+            encoder_hidden_states = encoder_outputs[0]
+            # 计算期望的输入维度
+            expected_dim = (
+                self.encoder.config.hidden_size
+                if hasattr(self.encoder.config, "hidden_size")
+                else self.encoder.config.vision_config.hidden_size
+            ) * len(self.feature_layers)
+            # 如果维度不匹配，需要重复或扩展特征（这里假设不会发生，因为我们强制开启了 hidden_states）
+            if encoder_hidden_states.shape[-1] != expected_dim:
+                # 如果维度不匹配，重复特征以匹配期望的输入维度
+                repeat_factor = expected_dim // encoder_hidden_states.shape[-1]
+                encoder_hidden_states = encoder_hidden_states.repeat(1, 1, repeat_factor)
 
         encoder_attention_mask = None
         if (labels is not None) and (decoder_input_ids is None and decoder_inputs_embeds is None):
@@ -714,19 +679,7 @@ class SmallCap(PreTrainedModel):
         # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
         img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
 
-        # Step 1.5: Visual Refinement (Mamba / CBSA / AR)
-        if self.visual_refiner is not None:
-            img_feats = self.visual_refiner(img_feats)
-
-        # ===== Step 2: 使用双路径增强模块增强图像特征 =====
-        if getattr(self, "use_dual_path_refiner", False):
-            img_feats = self.dual_path_refiner(img_feats)  # [B, N, fusion_dim]
-
-        # ===== Step 3: 使用AR模块增强图像特征（如果CBSA和双路径模块都未启用，则使用此路径） =====
-        if (getattr(self, "use_ar_adapter", False)
-            and not getattr(self, "use_dual_path_refiner", False)
-            and not getattr(self, "use_cbsa", False)):
-            img_feats = img_feats + self.image_ar_adapter(img_feats)
+        # 注意：VS模块（VisualSelector）将在文本特征处理后在Step 5中调用
 
         # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）
         # 这些参数已经从 kwargs 中移除，所以这里不再需要获取
@@ -735,7 +688,7 @@ class SmallCap(PreTrainedModel):
             # ===== Step 3: 使用CLIP text encoder生成caption embedding =====
             # encode_prompts 会接受 tensor 或字符串列表
             # 返回 (prompt_embeds_refined, prompt_embeds_raw, attn_mask)
-            prompt_embeds_refined, prompt_embeds_raw, attn_mask = self.encode_prompts(retrieved_caps,
+            prompt_embeds_refined, prompt_embeds_raw, attn_mask, alpha = self.encode_prompts(retrieved_caps,
                                                                                       visual_feats=img_feats)
 
             # 如果外部传入了 retrieved_caps_mask （来自 dataset/collate），优先使用它（按需）
@@ -779,20 +732,72 @@ class SmallCap(PreTrainedModel):
             # prompt_embeds: [B, L, D_text] or [B, D_text] (proj 会扩维)
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
-            # === [新增] Step 4.5: 使用文本特征对视觉特征进行反向去噪 ===
+            # ===== Step 5: Fusion Pipeline =====
+            # Step A (VS模块): 使用TextGuidedVisualSelector进行视觉特征增强
             if self.visual_selector is not None:
-                # 输入: 当前的图像特征 img_feats 和 投影后的文本特征 prompt_feats
-                # 输出: 去除背景噪音后的 img_feats
+                # TextGuidedVisualSelector需要(img_feats, text_feats)
+                # prompt_feats已经是[B, L, fusion_dim]形状，可以直接使用
                 img_feats = self.visual_selector(img_feats, prompt_feats)
+            
+            # Step B (GatedFusion): Global modulation and fusion
+            # 调用 GatedFusion 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
+            # GatedFusion需要img_feats和text_feats都是[B, N, C]形状
+            # 将prompt_feats池化为[B, C]，然后扩展到[B, N, C]以匹配img_feats的序列长度
+            B, N, C = img_feats.shape
+            if prompt_feats.dim() == 3:
+                # [B, L, C] -> [B, C] (平均池化)
+                prompt_feats_pooled = prompt_feats.mean(dim=1)
+            else:
+                # [B, C] 已经是池化后的
+                prompt_feats_pooled = prompt_feats
+            # 扩展到 [B, N, C] 以匹配img_feats的序列长度
+            prompt_feats_expanded = prompt_feats_pooled.unsqueeze(1).expand(B, N, C)
 
-            # ===== Step 5: 使用FiLM对image embedding和caption embedding进行融合 =====
-            # 调用 FiLM 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
-            # FiLM接受image_tokens和text_feats，text_feats可以是[B, L, C]或[B, C]
-            # 如果attn_mask存在，可以在pool之前应用mask（FiLM内部会做mean pooling）
-            img_feats = self.film_fusion(img_feats, prompt_feats)
+            # ================= 消融实验控制区 =================
 
-        # 最终把 img_feats 作为 encoder_hidden_states 传入 decoder
-        encoder_hidden_states = img_feats
+            # 1. 设置开关 (实际使用时建议写在 config 里，这里为了演示直接写变量)
+            use_vs_module = getattr(self.config, "use_visual_selector", False)  # 是否用 VS
+            use_smart_fusion = getattr(self.config, "use_gated_fusion", False)  # True=你的GatedFusion, False=基准融合
+
+            # --- 模块 A: Visual Selector (视觉去噪) ---
+            if use_vs_module and self.visual_selector is not None:
+                # 你的创新点：用文本过滤视觉
+                img_feats = self.visual_selector(img_feats, prompt_feats)
+            else:
+                # Baseline：不做任何视觉过滤，原封不动
+                pass
+
+            # --- 模块 B: Fusion Strategy (融合方式) ---
+            if use_smart_fusion:
+                # === 你的创新点：Reliability-Aware Gated Fusion ===
+
+                # 准备 reliability (来自 DPG 的 alpha)
+                global_reliability = None
+                if alpha is not None:
+                    global_reliability = alpha.mean(dim=(1, 2), keepdim=True)
+
+                # 调用你的高级融合模块
+                img_feats = self.gate_fusion(img_feats, prompt_feats_expanded, reliability=global_reliability)
+
+            else:
+                # === Baseline Fusion：简单的拼接 + 线性层 ===
+                # 模拟最普通的 SmallCap 或其它 RAG 模型做法
+                # 临时定义一个线性层 (注意：为了严谨，最好在 __init__ 里定义 self.baseline_linear)
+                if not hasattr(self, 'baseline_proj'):
+                    # 懒加载：如果是测试代码，可以在这里临时定义，或者去 __init__ 加一行
+                    self.baseline_proj = nn.Linear(C * 2, C).to(img_feats.device)
+
+                # 简单的拼接融合
+                concat_feats = torch.cat([img_feats, prompt_feats_expanded], dim=-1)  # [B, N, 2C]
+                img_feats = self.baseline_proj(concat_feats)  # [B, N, C]
+
+                # 或者更简单的：直接相加 (Add Fusion)
+                # img_feats = img_feats + prompt_feats_expanded
+
+            # ===============================================
+
+            # 最终把 img_feats 传给 decoder
+            encoder_hidden_states = img_feats
 
         # ===== Step 6: 计算辅助对比损失 (Auxiliary Contrastive Loss) =====
         loss_aux = None
@@ -999,12 +1004,13 @@ class SmallCap(PreTrainedModel):
 
         # None case
         if prompt_input is None:
-            return None, None, None
+            return None, None, None, None
 
         # If already tensor: assume pooled or token-level embeddings provided
         if torch.is_tensor(prompt_input):
             x = prompt_input.to(device)
             x_raw = x  # 保存原始特征
+            alpha = None
             # if 2D -> [B, D] treat as pooled single prompt per image
             if x.dim() == 2:
                 x = x.unsqueeze(1)  # [B, 1, D_text]
@@ -1014,8 +1020,8 @@ class SmallCap(PreTrainedModel):
                     visual_feats = visual_feats.to(device)
                     if self.tar_visual_proj is not None:
                         visual_feats = self.tar_visual_proj(visual_feats)
-                    x = self.tar_module(x, visual_feats)
-                return x, x_raw, attn_mask
+                    x, alpha = self.tar_module(x, visual_feats)
+                return x, x_raw, attn_mask, alpha
             # if 3D -> [B, K, D_text] already token-level/pool-level per caption
             if x.dim() == 3:
                 attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
@@ -1023,8 +1029,8 @@ class SmallCap(PreTrainedModel):
                     visual_feats = visual_feats.to(device)
                     if self.tar_visual_proj is not None:
                         visual_feats = self.tar_visual_proj(visual_feats)
-                    x = self.tar_module(x, visual_feats)
-                return x, x_raw, attn_mask
+                    x, alpha = self.tar_module(x, visual_feats)
+                return x, x_raw, attn_mask, alpha
             raise ValueError("Unsupported tensor dim for prompt_input: got dim = %d" % x.dim())
 
         # Else expect list[str] or list[list[str]]
@@ -1045,15 +1051,18 @@ class SmallCap(PreTrainedModel):
         outputs = self.text_encoder(**enc)
         prompt_embeds_raw = outputs.last_hidden_state  # [B, L_text, D_text] - 原始特征
 
-        # ===> BEGIN: 使用VG-TAR模块增强text encoder输出的文本特征 <===
+        # ===> BEGIN: DPG模块增强text encoder输出的文本特征 <===
         prompt_embeds_refined = prompt_embeds_raw  # 默认使用原始特征
+        alpha = None
         if self.tar_module is not None and visual_feats is not None:
             visual_feats = visual_feats.to(device)
             if self.tar_visual_proj is not None:
                 visual_feats = self.tar_visual_proj(visual_feats)
-            prompt_embeds_refined = self.tar_module(prompt_embeds_raw, visual_feats)
-        # ===> END: VG-TAR模块增强 <===
+            if hasattr(self, 'tar_visual_ln'):
+                visual_feats = self.tar_visual_ln(visual_feats)
+            prompt_embeds_refined, alpha = self.tar_module(prompt_embeds_raw, visual_feats)
+        # ===> END: DPG模块增强 <===
 
         attn_mask = enc.get("attention_mask", None)
         # 返回 (refined_embeds, raw_embeds, attn_mask) 用于上下文混合器
-        return prompt_embeds_refined, prompt_embeds_raw, attn_mask
+        return prompt_embeds_refined, prompt_embeds_raw, attn_mask, alpha

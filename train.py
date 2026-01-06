@@ -120,7 +120,7 @@ def get_model_and_auxiliaries(args):
         encoder_path,
         decoder_path,
         use_dpg=args.use_dpg,
-        use_visual_selector=args.use_visual_selector,
+        use_visual_selector=not getattr(args, "disable_visual_selector", False) and getattr(args, "use_visual_selector", True),
         # === AR 图像增强参数 ===
         use_ar_adapter=use_ar_adapter,
         ar_down_ratio=args.ar_down_ratio,
@@ -162,16 +162,10 @@ def get_model_and_auxiliaries(args):
     model.config.max_length = CAPTION_LENGTH
     model.config.rag = not args.disable_rag
 
-    # === FiLM 融合模块配置 ===
-    model.config.film_per_token = args.film_per_token
-    # film_use_residual: 如果指定了--disable_film_residual则为False，否则为True（默认）
-    model.config.film_use_residual = not args.disable_film_residual
-    model.config.film_init_alpha = args.film_init_alpha
-    model.config.film_text_pool = args.film_text_pool
-    model.config.film_dropout = args.film_dropout
-    if args.film_hidden is not None:
-        model.config.film_hidden = args.film_hidden
-    # === FiLM 融合模块配置结束 ===
+    # === 融合模块配置 ===
+    # 使用 GatedFusion 模块
+    model.config.gate_fusion_dropout = args.gate_fusion_dropout
+    # === 融合模块配置结束 ===
 
     # === TAR模块配置 ===
     model.config.use_tar_module = not args.disable_tar_module
@@ -181,6 +175,15 @@ def get_model_and_auxiliaries(args):
     model.config.tar_init_gate = args.tar_init_gate
     model.config.tar_ffn_dim = tar_ffn_dim  # [新增] 保存到 config
     # === TAR模块配置结束 ===
+
+    # === VS模块（VisualSelector）配置 ===
+    # 如果指定了--disable_visual_selector，则禁用；否则默认启用
+    if getattr(args, "disable_visual_selector", False):
+        model.config.use_visual_selector = False
+    else:
+        model.config.use_visual_selector = getattr(args, "use_visual_selector", True)
+    model.config.vs_dropout = getattr(args, "vs_dropout", 0.1)
+    # === VS模块配置结束 ===
 
     # === 辅助对比损失配置 ===
     model.config.use_aux_loss = not getattr(args, "disable_aux_loss", False)
@@ -225,14 +228,14 @@ def get_model_and_auxiliaries(args):
     if dual_path_params > 0:
         print(f'DualPathRefiner trainable params: {dual_path_params}')
 
-    # 统计 FiLM 融合模块的可训练参数
-    film_fusion_params = sum(
+    # 统计 GatedFusion 融合模块的可训练参数
+    gate_fusion_params = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if p.requires_grad and 'film_fusion' in n
+        if p.requires_grad and 'gate_fusion' in n
     )
-    if film_fusion_params > 0:
-        print(f'FiLM fusion trainable params: {film_fusion_params}')
+    if gate_fusion_params > 0:
+        print(f'GatedFusion trainable params: {gate_fusion_params}')
 
     # 统计 TAR 模块的可训练参数
     tar_params = sum(
@@ -338,8 +341,11 @@ def main(args):
                 gt_toks = clip_text_tokenizer(gt_texts, padding=True, truncation=True, return_tensors="pt")
                 gt_toks = {k: v.to(device) for k, v in gt_toks.items()}
                 gt_text_outputs = clip_text_encoder(**gt_toks)
-                # 使用 CLS token 的 hidden state 作为全局特征 [Batch, Clip_Dim]
-                gt_text_embeds = gt_text_outputs.last_hidden_state[:, 0, :].detach()  # [B, D_text]
+                if hasattr(gt_text_outputs, 'pooler_output') and gt_text_outputs.pooler_output is not None:
+                    gt_text_embeds = gt_text_outputs.pooler_output.detach()
+                else:
+                    eos_indices = gt_toks['input_ids'].argmax(dim=-1)
+                    gt_text_embeds = gt_text_outputs.last_hidden_state[torch.arange(gt_text_outputs.last_hidden_state.shape[0]), eos_indices].detach()
             collated["gt_text_embeds"] = gt_text_embeds
         else:
             collated["gt_text_embeds"] = None
@@ -561,30 +567,20 @@ def get_args_parser():
     parser.add_argument("--apr_n_queries", type=int, default=1,
                         help="Number of queries for AttentionPoolingRefiner")
     parser.add_argument("--apr_n_heads", type=int, default=8,
-                        help="Number of attention heads for AttentionPoolingRefiner")
+                        help="Number of attention heads for AttentionPoolingRefiner and QFormerLite")
     parser.add_argument("--apr_proj_back", action="store_true", default=False,
                         help="Whether to project back to token space in AttentionPoolingRefiner")
     parser.add_argument("--apr_dropout", type=float, default=0.1,
                         help="Dropout rate inside AttentionPoolingRefiner")
     # === 双路径增强模块参数结束 ===
 
-    # === FiLM 融合模块参数 ===
-    parser.add_argument("--film_per_token", action="store_true", default=False,
-                        help="Enable per-token FiLM modulation (default: False, global channel-wise)")
-    parser.add_argument("--disable_film_residual", action="store_true", default=False,
-                        help="Disable residual connection in FiLM (default: residual enabled)")
-    parser.add_argument("--film_init_alpha", type=float, default=0.1,
-                        help="Initial value for residual scaling factor in FiLM (default: 0.1)")
-    parser.add_argument("--film_text_pool", type=str, default="mean", choices=["mean", "cls"],
-                        help="Text feature pooling method for FiLM: 'mean' or 'cls' (default: mean)")
-    parser.add_argument("--film_dropout", type=float, default=0.0,
-                        help="Dropout rate in FiLM MLP (default: 0.0)")
-    parser.add_argument("--film_hidden", type=int, default=None,
-                        help="Hidden dimension for FiLM MLP (default: max(256, fusion_dim))")
-    # === FiLM 融合模块参数结束 ===
+    # === GatedFusion 融合模块参数 ===
+    parser.add_argument("--gate_fusion_dropout", type=float, default=0.1,
+                        help="Dropout rate in GatedFusion module (default: 0.1)")
+    # === GatedFusion 融合模块参数结束 ===
 
     # === TAR模块参数 ===
-    parser.add_argument("--disable_tar_module", action="store_true", default=False,
+    parser.add_argument("--disable_tar_module", action="store_true", default=True,
                         help="Disable TAR module enhancement on text encoder outputs")
     parser.add_argument("--tar_down_ratio", type=int, default=8,
                         help="Bottleneck ratio for TAR module hidden size (default: 8)")
@@ -604,7 +600,7 @@ def get_args_parser():
     # === 训练策略参数结束 ===
 
     # === 辅助对比损失参数 ===
-    parser.add_argument("--disable_aux_loss", action="store_true", default=False,
+    parser.add_argument("--disable_aux_loss", action="store_true", default=True,
                         help="Disable auxiliary contrastive loss (default: enabled)")
     parser.add_argument("--lambda_aux", type=float, default=0.1,
                         help="Weight for auxiliary contrastive loss (default: 0.1)")
@@ -628,10 +624,17 @@ def get_args_parser():
     parser.add_argument("--moe_topk", type=int, default=2,
                         help="Top-K experts active per token.")
 
-    parser.add_argument("--use_visual_selector", action="store_true", default=False,
-                        help="Enable Text-Guided Visual Selector for visual denoising.")
+    parser.add_argument("--use_visual_selector", action="store_true", default=True,
+                        help="Enable VS module (TextGuidedVisualSelector) for visual enhancement (default: enabled)")
+    parser.add_argument("--disable_visual_selector", action="store_true", default=False,
+                        help="Disable VS module (TextGuidedVisualSelector)")
+    parser.add_argument("--vs_dropout", type=float, default=0.1,
+                        help="Dropout rate in VS module (default: 0.1)")
+    parser.add_argument("--use_lmam", action="store_true", default=False,
+                        help="Use Low-Rank Matching Attention (LMAM) for fusion.")
 
     return parser
+
 
 if __name__ == '__main__':
     # 调用上面的函数获取 parser
