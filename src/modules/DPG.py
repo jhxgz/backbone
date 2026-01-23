@@ -76,6 +76,7 @@ class ChannelWiseDPG(nn.Module):
         # 2. 融合双重门控，得到最终去噪信号 alpha
         # alpha = 整体置信度 (Scalar) * 通道选择性 (Vector)
         alpha = scalar_weight * vector_gate  # (B, Lt, D)
+        # alpha = scalar_weight
 
         # --- Part 3: 特征输出 ---
 

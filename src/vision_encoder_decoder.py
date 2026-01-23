@@ -256,33 +256,33 @@ class SmallCap(PreTrainedModel):
 
         self.prompt_proj = PromptProjector(in_dim=text_hidden, out_dim=fusion_dim)
 
-        # ===> BEGIN: 添加VG-TAR模块用于增强text encoder输出的文本特征 <===
-        self.use_tar_module = getattr(self.config, "use_tar_module", True)
-        if self.use_tar_module and self.text_encoder is not None:
-            # === [修改] 使用 DPG 替换 VG-TAR ===
-            # 不需要复杂的 FFN 参数，只需要一个简单的线性层
-            print("Initializing Lightweight DPG Module (DoPL based)...")
-            self.tar_module = ChannelWiseDPG(
+        # ===> BEGIN: 添加DPG模块用于增强text encoder输出的文本特征 <===
+        self.use_dpg = getattr(self.config, "use_dpg", False)
+        if self.use_dpg and self.text_encoder is not None:
+            # === 使用 DPG (Detail-Oriented Prompt Generation) ===
+            print("Initializing DPG Module (Detail-Oriented Prompt Generation)...")
+            self.dpg_module = ChannelWiseDPG(
                 dim=text_hidden,
-                dropout=float(getattr(self.config, "tar_dropout", 0.1))
+                dropout=float(getattr(self.config, "dpg_dropout", 0.1))
             )
 
             # 维度对齐（如果视觉和文本维度不同）
             if fusion_dim != text_hidden:
-                self.tar_visual_proj = nn.Linear(fusion_dim, text_hidden)
+                self.dpg_visual_proj = nn.Linear(fusion_dim, text_hidden)
             else:
-                self.tar_visual_proj = None
+                self.dpg_visual_proj = None
             # === 新增: 专门给 DPG 输入的视觉特征做归一化 ===
-            self.tar_visual_ln = nn.LayerNorm(text_hidden)
+            self.dpg_visual_ln = nn.LayerNorm(text_hidden)
         else:
-            self.tar_module = None
-            self.tar_visual_proj = None
-        # ===> END: VG-TAR模块 <===
+            self.dpg_module = None
+            self.dpg_visual_proj = None
+            self.dpg_visual_ln = None
+        # ===> END: DPG模块 <===
 
 
         # ===> BEGIN: 添加上下文混合器 (Contextual Mixer) <===
-        # 用于平衡VG-TAR过滤后的特征和原始全局语义
-        if self.use_tar_module and self.text_encoder is not None:
+        # 用于平衡DPG过滤后的特征和原始全局语义
+        if self.use_dpg and self.text_encoder is not None:
             self.mixer_alpha = nn.Parameter(torch.ones(1) * 0.5)
         else:
             self.mixer_alpha = None
@@ -322,11 +322,24 @@ class SmallCap(PreTrainedModel):
         # ===> END: VS视觉增强模块 <===
 
         # === 融合模块初始化：使用 GatedFusion 模块 ===
-        print("Initializing GatedFusion module...")
-        self.gate_fusion = GatedFusion(
-            dim=fusion_dim,
-            dropout=float(getattr(self.config, "gate_fusion_dropout", 0.1))
-        )
+        self.use_gated_fusion = getattr(self.config, "use_gated_fusion", False)
+
+        if self.use_gated_fusion:
+            print("Initializing GatedFusion module...")
+            self.gate_fusion = GatedFusion(
+                dim=fusion_dim,
+                dropout=float(getattr(self.config, "gate_fusion_dropout", 0.1))
+            )
+        else:
+            print("GatedFusion disabled. Parameters will not be loaded.")
+            self.gate_fusion = None
+
+        # ============================================================
+        # 【在这里添加】Baseline Fusion 线性层
+        # 用于消融实验：当不使用 GatedFusion 时，使用此层将拼接后的特征投影回原来的维度
+        # 输入维度是 fusion_dim * 2 (Visual + Text 拼接)，输出维度是 fusion_dim
+        # ============================================================
+        self.baseline_proj = nn.Linear(fusion_dim * 2, fusion_dim)
 
         # ===> BEGIN: 辅助对比损失 (Auxiliary Contrastive Loss) <===
         # 用于监督融合层的中间特征，强制融合后的特征与 GT 文本的语义保持一致
@@ -679,6 +692,8 @@ class SmallCap(PreTrainedModel):
         # 将 encoder_hidden_states (B, N, C_clip) 投影到 fusion_dim
         img_feats = self.visual_proj(encoder_hidden_states)  # [B, N, fusion_dim]
 
+        encoder_hidden_states = img_feats
+
         # 注意：VS模块（VisualSelector）将在文本特征处理后在Step 5中调用
 
         # 从 kwargs 获取检索到的 captions 字段（Trainer 的 batch 需包含 'retrieved_captions'）
@@ -704,11 +719,11 @@ class SmallCap(PreTrainedModel):
                     # 两者都存在时，使用按位相与（若需）
                     attn_mask = (attn_mask.long() & retrieved_caps_mask.long()).long()
 
-            # ===== Step 3.5: 使用上下文混合器平衡VG-TAR过滤后的特征和原始全局语义 =====
+            # ===== Step 3.5: 使用上下文混合器平衡DPG过滤后的特征和原始全局语义 =====
             if self.mixer_alpha is not None and prompt_embeds_refined is not None and prompt_embeds_raw is not None:
-                # f_refined_tokens: VG-TAR模块的输出 [B, N, C]
+                # f_refined_tokens: DPG模块的输出 [B, N, C]
                 f_refined_tokens = prompt_embeds_refined
-                # f_raw_text_feats: 原始的、未经过VG-TAR处理的文本特征 [B, T, C]
+                # f_raw_text_feats: 原始的、未经过DPG处理的文本特征 [B, T, C]
                 f_raw_text_feats = prompt_embeds_raw
 
                 # 计算全局嵌入：对 f_raw_text_feats 进行平均池化，得到 f_global [B, C]
@@ -725,7 +740,7 @@ class SmallCap(PreTrainedModel):
                 # 将混合后的特征替换原来的 f_refined_tokens
                 prompt_embeds = f_mixed_prompt
             else:
-                # 如果没有上下文混合器，直接使用VG-TAR的输出（或原始特征）
+                # 如果没有上下文混合器，直接使用DPG的输出（或原始特征）
                 prompt_embeds = prompt_embeds_refined if prompt_embeds_refined is not None else prompt_embeds_raw
 
             # ===== Step 4: 投影caption embedding到融合维度 =====
@@ -733,11 +748,6 @@ class SmallCap(PreTrainedModel):
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
             # ===== Step 5: Fusion Pipeline =====
-            # Step A (VS模块): 使用TextGuidedVisualSelector进行视觉特征增强
-            if self.visual_selector is not None:
-                # TextGuidedVisualSelector需要(img_feats, text_feats)
-                # prompt_feats已经是[B, L, fusion_dim]形状，可以直接使用
-                img_feats = self.visual_selector(img_feats, prompt_feats)
             
             # Step B (GatedFusion): Global modulation and fusion
             # 调用 GatedFusion 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
@@ -762,7 +772,8 @@ class SmallCap(PreTrainedModel):
             # --- 模块 A: Visual Selector (视觉去噪) ---
             if use_vs_module and self.visual_selector is not None:
                 # 你的创新点：用文本过滤视觉
-                img_feats = self.visual_selector(img_feats, prompt_feats)
+                # 传入 DPG 计算出的 alpha 作为 reliability，用于可靠性控制
+                img_feats = self.visual_selector(img_feats, prompt_feats, reliability=alpha)
             else:
                 # Baseline：不做任何视觉过滤，原封不动
                 pass
@@ -774,7 +785,8 @@ class SmallCap(PreTrainedModel):
                 # 准备 reliability (来自 DPG 的 alpha)
                 global_reliability = None
                 if alpha is not None:
-                    global_reliability = alpha.mean(dim=(1, 2), keepdim=True)
+                    # 只对 Sequence 维度 (dim=1) 进行平均，保留 Channel 维度以便进行细粒度的去噪
+                    global_reliability = alpha.mean(dim=1, keepdim=True)
 
                 # 调用你的高级融合模块
                 img_feats = self.gate_fusion(img_feats, prompt_feats_expanded, reliability=global_reliability)
@@ -783,6 +795,7 @@ class SmallCap(PreTrainedModel):
                 # === Baseline Fusion：简单的拼接 + 线性层 ===
                 # 模拟最普通的 SmallCap 或其它 RAG 模型做法
                 # 临时定义一个线性层 (注意：为了严谨，最好在 __init__ 里定义 self.baseline_linear)
+                print("DEBUG: Using Baseline Fusion (Linear Projection)")
                 if not hasattr(self, 'baseline_proj'):
                     # 懒加载：如果是测试代码，可以在这里临时定义，或者去 __init__ 加一行
                     self.baseline_proj = nn.Linear(C * 2, C).to(img_feats.device)
@@ -1016,20 +1029,24 @@ class SmallCap(PreTrainedModel):
                 x = x.unsqueeze(1)  # [B, 1, D_text]
                 x_raw = x  # 更新原始特征
                 attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
-                if self.tar_module is not None and visual_feats is not None:
+                if self.dpg_module is not None and visual_feats is not None:
                     visual_feats = visual_feats.to(device)
-                    if self.tar_visual_proj is not None:
-                        visual_feats = self.tar_visual_proj(visual_feats)
-                    x, alpha = self.tar_module(x, visual_feats)
+                    if self.dpg_visual_proj is not None:
+                        visual_feats = self.dpg_visual_proj(visual_feats)
+                    if self.dpg_visual_ln is not None:
+                        visual_feats = self.dpg_visual_ln(visual_feats)
+                    x, alpha = self.dpg_module(x, visual_feats)
                 return x, x_raw, attn_mask, alpha
             # if 3D -> [B, K, D_text] already token-level/pool-level per caption
             if x.dim() == 3:
                 attn_mask = torch.ones(x.size(0), x.size(1), dtype=torch.long, device=device)
-                if self.tar_module is not None and visual_feats is not None:
+                if self.dpg_module is not None and visual_feats is not None:
                     visual_feats = visual_feats.to(device)
-                    if self.tar_visual_proj is not None:
-                        visual_feats = self.tar_visual_proj(visual_feats)
-                    x, alpha = self.tar_module(x, visual_feats)
+                    if self.dpg_visual_proj is not None:
+                        visual_feats = self.dpg_visual_proj(visual_feats)
+                    if self.dpg_visual_ln is not None:
+                        visual_feats = self.dpg_visual_ln(visual_feats)
+                    x, alpha = self.dpg_module(x, visual_feats)
                 return x, x_raw, attn_mask, alpha
             raise ValueError("Unsupported tensor dim for prompt_input: got dim = %d" % x.dim())
 
@@ -1054,13 +1071,13 @@ class SmallCap(PreTrainedModel):
         # ===> BEGIN: DPG模块增强text encoder输出的文本特征 <===
         prompt_embeds_refined = prompt_embeds_raw  # 默认使用原始特征
         alpha = None
-        if self.tar_module is not None and visual_feats is not None:
+        if self.dpg_module is not None and visual_feats is not None:
             visual_feats = visual_feats.to(device)
-            if self.tar_visual_proj is not None:
-                visual_feats = self.tar_visual_proj(visual_feats)
-            if hasattr(self, 'tar_visual_ln'):
-                visual_feats = self.tar_visual_ln(visual_feats)
-            prompt_embeds_refined, alpha = self.tar_module(prompt_embeds_raw, visual_feats)
+            if self.dpg_visual_proj is not None:
+                visual_feats = self.dpg_visual_proj(visual_feats)
+            if self.dpg_visual_ln is not None:
+                visual_feats = self.dpg_visual_ln(visual_feats)
+            prompt_embeds_refined, alpha = self.dpg_module(prompt_embeds_raw, visual_feats)
         # ===> END: DPG模块增强 <===
 
         attn_mask = enc.get("attention_mask", None)
