@@ -109,17 +109,11 @@ def get_model_and_auxiliaries(args):
         use_ar_adapter = False
         print("CBSA enabled: AR adapter will be disabled to avoid redundant enhancement.")
 
-    # [修改] 计算 VG-TAR 的 FFN 维度，强制设为 1x Hidden Size 以减少参数
-    # 默认 Transformer FFN 是 4x，这里改为 1x (例如 768 -> 768)
-    text_hidden_size = clip_text_encoder.config.hidden_size
-    tar_ffn_dim = int(text_hidden_size * 4)
-    print(f"Setting VG-TAR FFN dim to {tar_ffn_dim} (1x hidden size) for parameter efficiency.")
 
     # pass text encoder & tokenizer into SmallCap factory
     model = SmallCap.from_encoder_decoder_pretrained(
         encoder_path,
         decoder_path,
-        use_dpg=args.use_dpg,
         use_visual_selector=not getattr(args, "disable_visual_selector", False) and getattr(args, "use_visual_selector", True),
         # === AR 图像增强参数 ===
         use_ar_adapter=use_ar_adapter,
@@ -138,13 +132,12 @@ def get_model_and_auxiliaries(args):
         # === CBSA视觉增强模块参数 ===
         use_cbsa=args.use_cbsa,
         # ===
-        # === TAR模块参数 ===
-        use_tar_module=not args.disable_tar_module,
-        tar_down_ratio=args.tar_down_ratio,
-        tar_dropout=args.tar_dropout,
-        tar_use_gate=not args.disable_tar_gate,
-        tar_init_gate=args.tar_init_gate,
-        tar_ffn_dim=tar_ffn_dim,  # [新增] 传入压缩后的 FFN 维度
+        use_dpg=args.use_dpg,
+        dpg_dropout=args.dpg_dropout,
+
+        use_gated_fusion=getattr(args, "use_gated_fusion", False),
+        gate_fusion_dropout=args.gate_fusion_dropout,
+
         # ===
         cross_attention_reduce_factor=cross_attention_reduce_factor,
         text_encoder=clip_text_encoder,
@@ -165,16 +158,8 @@ def get_model_and_auxiliaries(args):
     # === 融合模块配置 ===
     # 使用 GatedFusion 模块
     model.config.gate_fusion_dropout = args.gate_fusion_dropout
+    model.config.use_gated_fusion = getattr(args, "use_gated_fusion", False)
     # === 融合模块配置结束 ===
-
-    # === TAR模块配置 ===
-    model.config.use_tar_module = not args.disable_tar_module
-    model.config.tar_down_ratio = args.tar_down_ratio
-    model.config.tar_dropout = args.tar_dropout
-    model.config.tar_use_gate = not args.disable_tar_gate
-    model.config.tar_init_gate = args.tar_init_gate
-    model.config.tar_ffn_dim = tar_ffn_dim  # [新增] 保存到 config
-    # === TAR模块配置结束 ===
 
     # === VS模块（VisualSelector）配置 ===
     # 如果指定了--disable_visual_selector，则禁用；否则默认启用
@@ -237,14 +222,14 @@ def get_model_and_auxiliaries(args):
     if gate_fusion_params > 0:
         print(f'GatedFusion trainable params: {gate_fusion_params}')
 
-    # 统计 TAR 模块的可训练参数
-    tar_params = sum(
+    # 统计 DPG 模块的可训练参数
+    dpg_params = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if p.requires_grad and 'tar_module' in n
+        if p.requires_grad and 'dpg_module' in n
     )
-    if tar_params > 0:
-        print(f'TAR module trainable params: {tar_params}')
+    if dpg_params > 0:
+        print(f'DPG module trainable params: {dpg_params}')
 
     # 统计辅助对比损失模块的可训练参数
     aux_loss_params = sum(
@@ -303,7 +288,6 @@ def main(args):
         output_dir = os.path.join(args.experiments_dir, output_dir)
         use_ar_adapter = not args.disable_ar_adapter
         use_dual_path_refiner = args.use_dual_path_refiner
-        use_tar_module = not args.disable_tar_module
         use_cbsa = getattr(args, "use_cbsa", False)
 
         # 如果启用CBSA，自动禁用AR模块（避免重复增强）
@@ -446,13 +430,13 @@ def main(args):
 
     # 创建自定义优化器，为门控参数设置独立的学习率
     def create_optimizer_with_gate_lr(model, training_args, gate_lr_ratio):
-        """创建优化器，为 VG-TAR 模块的门控参数设置更低的学习率"""
+        """创建优化器，为 DPG 模块的门控参数设置更低的学习率"""
         gate_params = []
         other_params = []
 
         for name, param in model.named_parameters():
             if param.requires_grad:
-                if 'tar_module' in name and 'gate' in name:
+                if ('dpg_module' in name or 'gate_fusion' in name) and 'gate' in name:
                     gate_params.append(param)
                 else:
                     other_params.append(param)
@@ -552,7 +536,8 @@ def get_args_parser():
                         help="Bottleneck ratio for AR adapter hidden size")
     parser.add_argument("--ar_dropout", type=float, default=0.1,
                         help="Dropout rate inside AR adapter")
-    parser.add_argument("--disable_ar_gate", action="store_true", default=False,
+    parser.add_argument("--disable_ar_gate", action="store_true", default=True
+                        ,
                         help="Disable learnable gate inside AR adapter")
     parser.add_argument("--use_cbsa", action="store_true", default=False,
                         help="Enable CBSA (Contract-and-Broadcast Self-Attention) visual refiner")
@@ -577,25 +562,19 @@ def get_args_parser():
     # === GatedFusion 融合模块参数 ===
     parser.add_argument("--gate_fusion_dropout", type=float, default=0.1,
                         help="Dropout rate in GatedFusion module (default: 0.1)")
+    parser.add_argument("--use_gated_fusion", action="store_true", default=False,
+                        help="Enable GatedFusion module. If False, use Baseline Fusion (Linear Projection).")
     # === GatedFusion 融合模块参数结束 ===
 
-    # === TAR模块参数 ===
-    parser.add_argument("--disable_tar_module", action="store_true", default=True,
-                        help="Disable TAR module enhancement on text encoder outputs")
-    parser.add_argument("--tar_down_ratio", type=int, default=8,
-                        help="Bottleneck ratio for TAR module hidden size (default: 8)")
-    parser.add_argument("--tar_dropout", type=float, default=0.1,
-                        help="Dropout rate inside TAR module (default: 0.1)")
-    parser.add_argument("--disable_tar_gate", action="store_true", default=False,
-                        help="Disable learnable gate inside TAR module")
-    parser.add_argument("--tar_init_gate", type=float, default=-4.0,
-                        help="Initial value for gate parameter in TAR module (default: -4.0, ensures Sigmoid(gate) near 0 at initialization)")
-    # === TAR模块参数结束 ===
+    # === DPG模块参数 ===
+    parser.add_argument("--dpg_dropout", type=float, default=0.1,
+                        help="Dropout rate inside DPG module (default: 0.1)")
+    # === DPG模块参数结束 ===
 
     # === 训练策略参数 ===
     parser.add_argument("--warmup_steps", type=int, default=None,
                         help="Number of warmup steps for learning rate scheduler (default: 1000 or 10%% of total steps, whichever is smaller)")
-    parser.add_argument("--gate_lr_ratio", type=float, default=0.5,
+    parser.add_argument("--gate_lr_ratio", type=float, default=1.0,
                         help="Learning rate ratio for gate parameters relative to baseline LR (default: 0.5, i.e., gate LR = 0.5 * base LR)")
     # === 训练策略参数结束 ===
 
