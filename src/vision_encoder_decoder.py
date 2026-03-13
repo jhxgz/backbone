@@ -50,6 +50,7 @@ from .modules.MambaAdapter import MambaAdapter
 from .modules.MoEAdapter import MoEAdapter
 from .modules.VisualSelector import TextGuidedVisualSelector
 
+
 # Copied from transformers.models.encoder_decoder.modeling_encoder_decoder.shift_tokens_right
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     """
@@ -278,7 +279,6 @@ class SmallCap(PreTrainedModel):
             self.dpg_visual_proj = None
             self.dpg_visual_ln = None
         # ===> END: DPG模块 <===
-
 
         # ===> BEGIN: 添加上下文混合器 (Contextual Mixer) <===
         # 用于平衡DPG过滤后的特征和原始全局语义
@@ -663,7 +663,7 @@ class SmallCap(PreTrainedModel):
             for layer_idx in self.feature_layers:
                 # 使用负数索引从后往前访问（-1是最后一层，-6是倒数第6层，-12是倒数第12层）
                 selected_features.append(encoder_outputs.hidden_states[layer_idx])
-            
+
             # 在通道维度（dim=-1）拼接多层特征
             encoder_hidden_states = torch.cat(selected_features, dim=-1)  # [B, N, enc_hidden * len(feature_layers)]
         else:
@@ -672,10 +672,10 @@ class SmallCap(PreTrainedModel):
             encoder_hidden_states = encoder_outputs[0]
             # 计算期望的输入维度
             expected_dim = (
-                self.encoder.config.hidden_size
-                if hasattr(self.encoder.config, "hidden_size")
-                else self.encoder.config.vision_config.hidden_size
-            ) * len(self.feature_layers)
+                               self.encoder.config.hidden_size
+                               if hasattr(self.encoder.config, "hidden_size")
+                               else self.encoder.config.vision_config.hidden_size
+                           ) * len(self.feature_layers)
             # 如果维度不匹配，需要重复或扩展特征（这里假设不会发生，因为我们强制开启了 hidden_states）
             if encoder_hidden_states.shape[-1] != expected_dim:
                 # 如果维度不匹配，重复特征以匹配期望的输入维度
@@ -704,7 +704,7 @@ class SmallCap(PreTrainedModel):
             # encode_prompts 会接受 tensor 或字符串列表
             # 返回 (prompt_embeds_refined, prompt_embeds_raw, attn_mask)
             prompt_embeds_refined, prompt_embeds_raw, attn_mask, alpha = self.encode_prompts(retrieved_caps,
-                                                                                      visual_feats=img_feats)
+                                                                                             visual_feats=img_feats)
 
             # 如果外部传入了 retrieved_caps_mask （来自 dataset/collate），优先使用它（按需）
             if retrieved_caps_mask is not None:
@@ -748,7 +748,7 @@ class SmallCap(PreTrainedModel):
             prompt_feats = self.prompt_proj(prompt_embeds)  # [B, L, fusion_dim]
 
             # ===== Step 5: Fusion Pipeline =====
-            
+
             # Step B (GatedFusion): Global modulation and fusion
             # 调用 GatedFusion 进行跨模态融合，返回增强后的图像特征 [B, N, fusion_dim]
             # GatedFusion需要img_feats和text_feats都是[B, N, C]形状

@@ -574,7 +574,7 @@ def get_args_parser():
     # === 训练策略参数 ===
     parser.add_argument("--warmup_steps", type=int, default=None,
                         help="Number of warmup steps for learning rate scheduler (default: 1000 or 10%% of total steps, whichever is smaller)")
-    parser.add_argument("--gate_lr_ratio", type=float, default=1.0,
+    parser.add_argument("--gate_lr_ratio", type=float, default=0.5,
                         help="Learning rate ratio for gate parameters relative to baseline LR (default: 0.5, i.e., gate LR = 0.5 * base LR)")
     # === 训练策略参数结束 ===
 

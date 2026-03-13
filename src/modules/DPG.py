@@ -34,7 +34,7 @@ class ChannelWiseDPG(nn.Module):
             nn.Linear(dim // 4, dim),  # 升维回 D
             nn.Sigmoid()  # 关键：输出 0~1 的门控值
         )
-        
+
         # 初始化最后一层偏置，确保训练初期 Sigmoid 输出接近 0.88，让门控默认处于"开启"状态
         nn.init.constant_(self.channel_gate_mlp[-2].bias, 2.0)
 
